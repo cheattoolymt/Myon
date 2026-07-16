@@ -18,6 +18,8 @@
 #include "value.h"
 #include "env.h"
 #include "common.h"
+#include "lexer.h"
+#include "parser.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,16 +27,39 @@
 #include <setjmp.h>
 #include <stdarg.h>
 #include <limits.h>
+#include <math.h>
+#include <ctype.h>
 
 /* ------------------------------------------------------------------ */
 /* Interpreter state and control-flow signalling                       */
 /* ------------------------------------------------------------------ */
 
-typedef enum { FLOW_NORMAL, FLOW_BREAK, FLOW_CONTINUE } Flow;
+typedef enum { FLOW_NORMAL, FLOW_BREAK, FLOW_CONTINUE, FLOW_RETURN } Flow;
+
+/* registry of declared structs (for constructor / method lookup) */
+typedef struct {
+    StructDecl **items;
+    int          count;
+} StructReg;
+
+/* modules that have been loaded (for cycle detection + namespaces) */
+typedef struct ModuleEntry {
+    char               *path;    /* dotted path */
+    char               *alias;   /* alias or NULL */
+    int                 loading; /* in-progress flag for cycle detection */
+    struct ModuleEntry *next;
+} ModuleEntry;
 
 typedef struct {
-    Env    *global;
-    jmp_buf on_error;   /* longjmp target for runtime errors */
+    Env         *global;
+    StructReg    structs;
+    ModuleEntry *modules;
+    jmp_buf      on_error;
+    /* return-value transport */
+    Value       *ret_values;
+    int          ret_count;
+    /* generic type-parameter bindings active in the current call */
+    Env         *type_env;   /* name -> not used as value; tracked separately */
 } Interp;
 
 static void runtime_error(Interp *it, int line, const char *fmt, ...) {
@@ -49,6 +74,26 @@ static void runtime_error(Interp *it, int line, const char *fmt, ...) {
 
 static Value eval_expr(Interp *it, Env *env, Expr *e);
 static Flow  exec_block(Interp *it, Env *env, StmtList *body);
+static Flow  exec_stmt(Interp *it, Env *env, Stmt *s);
+static Value call_function(Interp *it, int line, Value fn, Value *args, int argc,
+                           char **arg_names);
+
+/* ------------------------------------------------------------------ */
+/* Struct registry                                                     */
+/* ------------------------------------------------------------------ */
+
+static void register_struct(Interp *it, StructDecl *sd) {
+    it->structs.items = (StructDecl **)myon_xrealloc(
+        it->structs.items, sizeof(StructDecl *) * (it->structs.count + 1));
+    it->structs.items[it->structs.count++] = sd;
+}
+
+static StructDecl *find_struct(Interp *it, const char *name) {
+    for (int i = 0; i < it->structs.count; i++)
+        if (strcmp(it->structs.items[i]->name, name) == 0)
+            return it->structs.items[i];
+    return NULL;
+}
 
 /* ------------------------------------------------------------------ */
 /* Casts / value constructors (spec 2.3)                               */
@@ -65,23 +110,25 @@ static Value cast_to_int(Interp *it, int line, Value v) {
     switch (v.type) {
         case TYPE_INT: return v;
         case TYPE_FLOAT: { long long r = (long long)v.as.f; return value_int(r); }
-        case TYPE_BOOL: { long long r = v.as.b; value_free(&v); return value_int(r); }
+        case TYPE_BOOL: { long long r = v.as.b; return value_int(r); }
         case TYPE_STR: {
             char *end = NULL;
-            long long r = strtoll(v.as.s, &end, 10);
-            if (end == v.as.s || *end != '\0')
-                runtime_error(it, line, "int(): cannot parse '%s' as integer", v.as.s);
+            long long r = strtoll(v.as.obj->as.str, &end, 10);
+            if (end == v.as.obj->as.str || *end != '\0') {
+                char *bad = myon_strdup(v.as.obj->as.str);
+                value_free(&v);
+                runtime_error(it, line, "int(): cannot parse '%s' as integer", bad);
+            }
             value_free(&v);
             return value_int(r);
         }
         case TYPE_CHAR: {
-            /* first byte's codepoint (ASCII path) */
-            long long r = (unsigned char)v.as.s[0];
+            long long r = (unsigned char)v.as.obj->as.str[0];
             value_free(&v);
             return value_int(r);
         }
         default:
-            runtime_error(it, line, "int(): unsupported source type %s", type_name(v.type));
+            runtime_error(it, line, "int(): unsupported source type %s", value_type_name(&v));
             return value_nil();
     }
 }
@@ -90,21 +137,20 @@ static Value cast_to_char(Interp *it, int line, Value v) {
     switch (v.type) {
         case TYPE_CHAR: return v;
         case TYPE_INT: {
-            /* interpret as ASCII/first-byte codepoint */
             char buf[2] = { (char)(v.as.i & 0xFF), '\0' };
-            value_free(&v);
             return value_char(myon_strdup(buf));
         }
         case TYPE_STR: {
-            if (strlen(v.as.s) == 0)
+            if (strlen(v.as.obj->as.str) == 0) {
+                value_free(&v);
                 runtime_error(it, line, "char(): empty string");
-            /* keep exactly one (byte) character for the ASCII subset */
-            char buf[2] = { v.as.s[0], '\0' };
+            }
+            char buf[2] = { v.as.obj->as.str[0], '\0' };
             value_free(&v);
             return value_char(myon_strdup(buf));
         }
         default:
-            runtime_error(it, line, "char(): unsupported source type %s", type_name(v.type));
+            runtime_error(it, line, "char(): unsupported source type %s", value_type_name(&v));
             return value_nil();
     }
 }
@@ -113,7 +159,6 @@ static Value cast_to_char(Interp *it, int line, Value v) {
 /* Arithmetic / comparison with strict typing (spec 2.2)               */
 /* ------------------------------------------------------------------ */
 
-/* checked integer arithmetic (spec 0.2: overflow is a runtime error) */
 static long long int_arith(Interp *it, int line, OpKind op, long long a, long long b) {
     long long r;
     switch (op) {
@@ -153,23 +198,25 @@ static int compare_ordered(double a, double b, OpKind op) {
 }
 
 static Value eval_binary(Interp *it, int line, OpKind op, Value l, Value r) {
-    /* equality against myon.nil is allowed for the error type (spec 2.4/6.2) */
     if (op == OP_EQ || op == OP_NEQ) {
         if (l.type == TYPE_NIL || r.type == TYPE_NIL) {
             int both_nil = (l.type == TYPE_NIL && r.type == TYPE_NIL);
             int one_err_nil =
                 (l.type == TYPE_ERROR && r.type == TYPE_NIL) ||
                 (r.type == TYPE_ERROR && l.type == TYPE_NIL);
-            if (!both_nil && !one_err_nil)
+            if (!both_nil && !one_err_nil) {
+                Type lt = l.type, rt = r.type;
+                value_free(&l); value_free(&r);
                 runtime_error(it, line,
-                    "myon.nil may only be compared with error values (spec 2.4)");
-            int equal = both_nil; /* an error != nil */
+                    "myon.nil may only be compared with error values (spec 2.4); got %s and %s",
+                    type_name(lt), type_name(rt));
+            }
+            int equal = both_nil;
             value_free(&l); value_free(&r);
             return value_bool(op == OP_EQ ? equal : !equal);
         }
     }
 
-    /* strict typing: operands must share a type */
     if (!type_equal(l.type, r.type)) {
         Type lt = l.type, rt = r.type;
         value_free(&l); value_free(&r);
@@ -184,12 +231,9 @@ static Value eval_binary(Interp *it, int line, OpKind op, Value l, Value r) {
             switch (op) {
                 case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV:
                     return value_int(int_arith(it, line, op, a, b));
-                case OP_EQ: case OP_NEQ: case OP_LT:
-                case OP_GT: case OP_LE: case OP_GE:
+                default:
                     return value_bool(compare_ordered((double)a, (double)b, op));
-                default: break;
             }
-            break;
         }
         case TYPE_FLOAT: {
             double a = l.as.f, b = r.as.f;
@@ -200,46 +244,54 @@ static Value eval_binary(Interp *it, int line, OpKind op, Value l, Value r) {
                 case OP_DIV:
                     if (b == 0.0) runtime_error(it, line, "division by zero");
                     return value_float(a / b);
-                case OP_EQ: case OP_NEQ: case OP_LT:
-                case OP_GT: case OP_LE: case OP_GE:
-                    return value_bool(compare_ordered(a, b, op));
-                default: break;
+                default: return value_bool(compare_ordered(a, b, op));
             }
-            break;
         }
         case TYPE_STR: {
+            const char *ls = l.as.obj->as.str, *rs = r.as.obj->as.str;
             if (op == OP_ADD) {
-                size_t la = strlen(l.as.s), lb = strlen(r.as.s);
+                size_t la = strlen(ls), lb = strlen(rs);
                 char *buf = (char *)myon_xmalloc(la + lb + 1);
-                memcpy(buf, l.as.s, la);
-                memcpy(buf + la, r.as.s, lb);
+                memcpy(buf, ls, la);
+                memcpy(buf + la, rs, lb);
                 buf[la + lb] = '\0';
                 value_free(&l); value_free(&r);
                 return value_str(buf);
             }
             if (op == OP_EQ || op == OP_NEQ) {
-                int eq = strcmp(l.as.s, r.as.s) == 0;
+                int eq = strcmp(ls, rs) == 0;
                 value_free(&l); value_free(&r);
                 return value_bool(op == OP_EQ ? eq : !eq);
             }
+            value_free(&l); value_free(&r);
             runtime_error(it, line, "unsupported operator on str");
             break;
         }
         case TYPE_CHAR: {
+            int eq = strcmp(l.as.obj->as.str, r.as.obj->as.str) == 0;
             if (op == OP_EQ || op == OP_NEQ) {
-                int eq = strcmp(l.as.s, r.as.s) == 0;
                 value_free(&l); value_free(&r);
                 return value_bool(op == OP_EQ ? eq : !eq);
             }
+            value_free(&l); value_free(&r);
             runtime_error(it, line, "unsupported operator on char");
             break;
         }
         case TYPE_BOOL: {
+            int eq = (l.as.b == r.as.b);
+            if (op == OP_EQ || op == OP_NEQ)
+                return value_bool(op == OP_EQ ? eq : !eq);
+            runtime_error(it, line, "unsupported operator on bool");
+            break;
+        }
+        case TYPE_ERROR: {
+            int eq = strcmp(l.as.obj->as.str, r.as.obj->as.str) == 0;
             if (op == OP_EQ || op == OP_NEQ) {
-                int eq = (l.as.b == r.as.b);
+                value_free(&l); value_free(&r);
                 return value_bool(op == OP_EQ ? eq : !eq);
             }
-            runtime_error(it, line, "unsupported operator on bool");
+            value_free(&l); value_free(&r);
+            runtime_error(it, line, "unsupported operator on error");
             break;
         }
         default:
@@ -249,7 +301,73 @@ static Value eval_binary(Interp *it, int line, OpKind op, Value l, Value r) {
 }
 
 /* ------------------------------------------------------------------ */
-/* myon.print builtin (spec section 10)                                */
+/* String interpolation (spec section 4, Step 10)                      */
+/* ------------------------------------------------------------------ */
+
+/* Evaluate a raw string body, expanding `{expr}` fragments.
+ * `{{` and `}}` are literal braces. */
+static Value interpolate_string(Interp *it, Env *env, int line, const char *raw) {
+    size_t cap = strlen(raw) + 1, len = 0;
+    char *out = (char *)myon_xmalloc(cap);
+    out[0] = '\0';
+
+    const char *s = raw;
+    while (*s) {
+        if (s[0] == '{' && s[1] == '{') { /* literal { */
+            if (len + 1 >= cap) { cap *= 2; out = myon_xrealloc(out, cap); }
+            out[len++] = '{'; out[len] = '\0'; s += 2; continue;
+        }
+        if (s[0] == '}' && s[1] == '}') {
+            if (len + 1 >= cap) { cap *= 2; out = myon_xrealloc(out, cap); }
+            out[len++] = '}'; out[len] = '\0'; s += 2; continue;
+        }
+        if (s[0] == '{') {
+            /* find matching '}' */
+            const char *end = strchr(s + 1, '}');
+            if (!end) {
+                free(out);
+                runtime_error(it, line, "unterminated '{' in string interpolation");
+            }
+            size_t exprlen = (size_t)(end - (s + 1));
+            char *exprsrc = myon_strndup(s + 1, exprlen);
+
+            /* lex + parse the sub-expression */
+            TokenList tl;
+            if (!lexer_tokenize(exprsrc, &tl)) {
+                free(exprsrc); free(out);
+                runtime_error(it, line, "lexical error in interpolation '{%s}'", "");
+            }
+            Program *sub = parser_parse(&tl);
+            free(exprsrc);
+            if (!sub || sub->stmts.count != 1 || sub->stmts.items[0]->kind != STMT_EXPR) {
+                if (sub) program_free(sub);
+                token_list_free(&tl);
+                free(out);
+                runtime_error(it, line, "invalid expression in string interpolation");
+            }
+            Value v = eval_expr(it, env, sub->stmts.items[0]->as.expr);
+            char *piece = value_to_cstr(&v);
+            value_free(&v);
+            program_free(sub);
+            token_list_free(&tl);
+
+            size_t pl = strlen(piece);
+            while (len + pl + 1 >= cap) { cap *= 2; out = myon_xrealloc(out, cap); }
+            memcpy(out + len, piece, pl + 1);
+            len += pl;
+            free(piece);
+            s = end + 1;
+            continue;
+        }
+        if (len + 1 >= cap) { cap *= 2; out = myon_xrealloc(out, cap); }
+        out[len++] = *s++;
+        out[len] = '\0';
+    }
+    return value_str(out);
+}
+
+/* ------------------------------------------------------------------ */
+/* Builtins: myon.print / myon.input                                   */
 /* ------------------------------------------------------------------ */
 
 static Value builtin_print(Interp *it, Env *env, Expr *call) {
@@ -266,16 +384,457 @@ static Value builtin_print(Interp *it, Env *env, Expr *call) {
     return value_void();
 }
 
+static Value builtin_input(Interp *it, Env *env, Expr *call) {
+    if (call->as.call.arg_count > 0) {
+        Value prompt = eval_expr(it, env, call->as.call.args[0]);
+        char *s = value_to_cstr(&prompt);
+        fputs(s, stdout);
+        fflush(stdout);
+        free(s);
+        value_free(&prompt);
+    }
+    size_t cap = 128, len = 0;
+    char *buf = (char *)myon_xmalloc(cap);
+    int c;
+    while ((c = fgetc(stdin)) != EOF && c != '\n') {
+        if (len + 1 >= cap) { cap *= 2; buf = myon_xrealloc(buf, cap); }
+        buf[len++] = (char)c;
+    }
+    buf[len] = '\0';
+    return value_str(buf);
+}
+
+/* ------------------------------------------------------------------ */
+/* Standard library: myon.math / myon.string (Step 16)                 */
+/* ------------------------------------------------------------------ */
+
+static Value eval_arg(Interp *it, Env *env, Expr *call, int i) {
+    return eval_expr(it, env, call->as.call.args[i]);
+}
+
+static double as_number(Interp *it, int line, Value v) {
+    if (v.type == TYPE_INT) { double d = (double)v.as.i; return d; }
+    if (v.type == TYPE_FLOAT) return v.as.f;
+    runtime_error(it, line, "expected a numeric argument, got %s", type_name(v.type));
+    return 0;
+}
+
+/* dispatch a "myon.math.<fn>" or "myon.string.<fn>" call.
+ * Returns 1 and sets *out if handled. */
+static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value *out) {
+    int argc = call->as.call.arg_count;
+    int line = call->line;
+
+    /* ---- myon.math ---- */
+    if (strcmp(name, "myon.math.sqrt") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        *out = value_float(sqrt(as_number(it, line, a))); value_free(&a); return 1;
+    }
+    if (strcmp(name, "myon.math.pow") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
+        *out = value_float(pow(as_number(it, line, a), as_number(it, line, b)));
+        value_free(&a); value_free(&b); return 1;
+    }
+    if (strcmp(name, "myon.math.abs") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        if (a.type == TYPE_INT) { long long v = a.as.i < 0 ? -a.as.i : a.as.i; *out = value_int(v); }
+        else *out = value_float(fabs(as_number(it, line, a)));
+        value_free(&a); return 1;
+    }
+    if (strcmp(name, "myon.math.floor") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        *out = value_int((long long)floor(as_number(it, line, a))); value_free(&a); return 1;
+    }
+    if (strcmp(name, "myon.math.ceil") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        *out = value_int((long long)ceil(as_number(it, line, a))); value_free(&a); return 1;
+    }
+    if (strcmp(name, "myon.math.max") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
+        double x = as_number(it, line, a), y = as_number(it, line, b);
+        int use_int = (a.type == TYPE_INT && b.type == TYPE_INT);
+        *out = use_int ? value_int(x > y ? (long long)x : (long long)y)
+                       : value_float(x > y ? x : y);
+        value_free(&a); value_free(&b); return 1;
+    }
+    if (strcmp(name, "myon.math.min") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
+        double x = as_number(it, line, a), y = as_number(it, line, b);
+        int use_int = (a.type == TYPE_INT && b.type == TYPE_INT);
+        *out = use_int ? value_int(x < y ? (long long)x : (long long)y)
+                       : value_float(x < y ? x : y);
+        value_free(&a); value_free(&b); return 1;
+    }
+
+    /* ---- myon.string ---- */
+    if (strcmp(name, "myon.string.length") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        if (a.type != TYPE_STR) { value_free(&a); runtime_error(it, line, "myon.string.length expects str"); }
+        *out = value_int((long long)strlen(a.as.obj->as.str));
+        value_free(&a); return 1;
+    }
+    if (strcmp(name, "myon.string.concat") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
+        if (a.type != TYPE_STR || b.type != TYPE_STR) {
+            value_free(&a); value_free(&b);
+            runtime_error(it, line, "myon.string.concat expects two str values");
+        }
+        *out = eval_binary(it, line, OP_ADD, a, b); return 1;
+    }
+    if (strcmp(name, "myon.string.contains") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
+        if (a.type != TYPE_STR || b.type != TYPE_STR) {
+            value_free(&a); value_free(&b);
+            runtime_error(it, line, "myon.string.contains expects two str values");
+        }
+        int found = strstr(a.as.obj->as.str, b.as.obj->as.str) != NULL;
+        value_free(&a); value_free(&b);
+        *out = value_bool(found); return 1;
+    }
+    if (strcmp(name, "myon.string.upper") == 0 || strcmp(name, "myon.string.lower") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        if (a.type != TYPE_STR) { value_free(&a); runtime_error(it, line, "expects str"); }
+        int up = (name[strlen(name)-1] == 'r' && strstr(name, "upper"));
+        char *s = myon_strdup(a.as.obj->as.str);
+        for (char *c = s; *c; c++)
+            *c = up ? (char)toupper((unsigned char)*c) : (char)tolower((unsigned char)*c);
+        value_free(&a);
+        *out = value_str(s); return 1;
+    }
+    (void)argc;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Method dispatch on arrays / maps / structs                          */
+/* ------------------------------------------------------------------ */
+
+static int typespec_matches_value(Interp *it, TypeSpec *ts, const Value *v);
+
+static Value call_method(Interp *it, Env *env, Expr *call, Value recv,
+                         const char *method) {
+    int line = call->line;
+    int argc = call->as.call.arg_count;
+
+    if (recv.type == TYPE_ARRAY) {
+        ArrayData *a = &recv.as.obj->as.arr;
+        if (strcmp(method, "push") == 0) {
+            if (argc != 1) runtime_error(it, line, "push expects 1 argument");
+            Value v = eval_expr(it, env, call->as.call.args[0]);
+            if (a->elem_type && !typespec_matches_value(it, a->elem_type, &v)) {
+                char *want = typespec_to_cstr(a->elem_type);
+                const char *got = value_type_name(&v);
+                value_free(&v);
+                runtime_error(it, line,
+                    "type mismatch: cannot push %s into myon.array(%s)", got, want);
+            }
+            array_push(&recv, v);
+            return value_void();
+        }
+        if (strcmp(method, "pop") == 0) {
+            Value out;
+            if (!array_pop(&recv, &out))
+                runtime_error(it, line, "pop from empty array");
+            return out;
+        }
+        if (strcmp(method, "length") == 0) {
+            return value_int(a->count);
+        }
+        runtime_error(it, line, "unknown array method '%s'", method);
+    }
+
+    if (recv.type == TYPE_MAP) {
+        if (strcmp(method, "set") == 0) {
+            Value k = eval_expr(it, env, call->as.call.args[0]);
+            Value v = eval_expr(it, env, call->as.call.args[1]);
+            map_set(&recv, k, v);
+            return value_void();
+        }
+        if (strcmp(method, "get") == 0) {
+            Value k = eval_expr(it, env, call->as.call.args[0]);
+            Value out;
+            if (!map_get(&recv, &k, &out)) { value_free(&k); return value_nil(); }
+            value_free(&k);
+            return out;
+        }
+        if (strcmp(method, "has") == 0) {
+            Value k = eval_expr(it, env, call->as.call.args[0]);
+            int has = map_has(&recv, &k);
+            value_free(&k);
+            return value_bool(has);
+        }
+        if (strcmp(method, "delete") == 0) {
+            Value k = eval_expr(it, env, call->as.call.args[0]);
+            int ok = map_delete(&recv, &k);
+            value_free(&k);
+            return value_bool(ok);
+        }
+        runtime_error(it, line, "unknown map method '%s'", method);
+    }
+
+    if (recv.type == TYPE_STRUCT) {
+        StructDecl *sd = recv.as.obj->as.st.decl;
+        /* search up the inheritance chain for the method */
+        FuncDecl *m = NULL;
+        for (StructDecl *cur = sd; cur && !m; cur = cur->parent) {
+            for (int i = 0; i < cur->method_count; i++)
+                if (strcmp(cur->methods[i]->name, method) == 0) { m = cur->methods[i]; break; }
+        }
+        if (!m)
+            runtime_error(it, line, "struct '%s' has no method '%s'",
+                          recv.as.obj->as.st.type_name, method);
+
+        /* evaluate arguments */
+        Value *args = argc ? (Value *)myon_xmalloc(sizeof(Value) * argc) : NULL;
+        for (int i = 0; i < argc; i++)
+            args[i] = eval_expr(it, env, call->as.call.args[i]);
+
+        /* bind a function value with self = recv */
+        Value fnv = value_func(m, it->global);
+        fnv.as.obj->as.fn.is_bound = 1;
+        fnv.as.obj->as.fn.bound_self = (Value *)myon_xmalloc(sizeof(Value));
+        *fnv.as.obj->as.fn.bound_self = value_copy(&recv);
+
+        Value r = call_function(it, line, fnv, args, argc, NULL);
+        value_free(&fnv);
+        for (int i = 0; i < argc; i++) value_free(&args[i]);
+        free(args);
+        return r;
+    }
+
+    runtime_error(it, line, "type %s has no methods", value_type_name(&recv));
+    return value_nil();
+}
+
+/* ------------------------------------------------------------------ */
+/* Struct construction (StructName(field=..., ...))                    */
+/* ------------------------------------------------------------------ */
+
+/* collect fields from the whole inheritance chain (parent first) */
+static void collect_fields(StructDecl *sd, StructField **out, int *count) {
+    if (!sd) return;
+    collect_fields(sd->parent, out, count);
+    for (int i = 0; i < sd->field_count; i++) {
+        *out = (StructField *)myon_xrealloc(*out, sizeof(StructField) * (*count + 1));
+        (*out)[(*count)++] = sd->fields[i];
+    }
+}
+
+static Value construct_struct(Interp *it, Env *env, Expr *call, StructDecl *sd,
+                              TypeSpec **type_args, int type_arg_count) {
+    int line = call->line;
+    Value sv = value_struct(sd->name, sd);
+
+    /* record generic bindings on the instance (Step 15) */
+    if (type_arg_count > 0) {
+        StructData *st = &sv.as.obj->as.st;
+        st->tparam_count = type_arg_count;
+        st->tparam_names = (char **)myon_xmalloc(sizeof(char *) * type_arg_count);
+        st->tparam_types = (TypeSpec **)myon_xmalloc(sizeof(TypeSpec *) * type_arg_count);
+        for (int i = 0; i < type_arg_count && i < sd->tparam_count; i++) {
+            st->tparam_names[i] = myon_strdup(sd->tparams[i]);
+            st->tparam_types[i] = typespec_clone(type_args[i]);
+        }
+        /* fill remaining names if fewer args than params */
+        for (int i = sd->tparam_count; i < type_arg_count; i++) {
+            st->tparam_names[i] = myon_strdup("?");
+            st->tparam_types[i] = typespec_clone(type_args[i]);
+        }
+    }
+
+    StructField *fields = NULL;
+    int fcount = 0;
+    collect_fields(sd, &fields, &fcount);
+
+    /* initialise every field, matching named arguments */
+    for (int i = 0; i < fcount; i++) {
+        Value fv = value_nil();
+        int found = 0;
+        for (int j = 0; j < call->as.call.arg_count; j++) {
+            if (call->as.call.arg_names[j] &&
+                strcmp(call->as.call.arg_names[j], fields[i].name) == 0) {
+                fv = eval_expr(it, env, call->as.call.args[j]);
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            free(fields);
+            value_free(&sv);
+            runtime_error(it, line, "missing field '%s' in %s(...) construction",
+                          fields[i].name, sd->name);
+        }
+        struct_add_field(&sv, fields[i].name, fv);
+    }
+    free(fields);
+    return sv;
+}
+
+/* ------------------------------------------------------------------ */
+/* typespec / value compatibility                                      */
+/* ------------------------------------------------------------------ */
+
+static int typespec_matches_value(Interp *it, TypeSpec *ts, const Value *v) {
+    (void)it;
+    if (!ts) return 1;
+    switch (ts->base) {
+        case TYPE_INT:    return v->type == TYPE_INT;
+        case TYPE_FLOAT:  return v->type == TYPE_FLOAT;
+        case TYPE_STR:    return v->type == TYPE_STR;
+        case TYPE_CHAR:   return v->type == TYPE_CHAR;
+        case TYPE_BOOL:   return v->type == TYPE_BOOL;
+        case TYPE_VOID:   return v->type == TYPE_VOID;
+        case TYPE_ERROR:  return v->type == TYPE_ERROR || v->type == TYPE_NIL;
+        case TYPE_ARRAY:  return v->type == TYPE_ARRAY;
+        case TYPE_MAP:    return v->type == TYPE_MAP;
+        case TYPE_STRUCT:
+            /* a bare identifier annotation: struct name OR a generic
+             * type parameter — accept structurally by name, else accept any
+             * (type parameters are erased at runtime). */
+            if (v->type == TYPE_STRUCT)
+                return strcmp(ts->name, v->as.obj->as.st.type_name) == 0;
+            /* unknown struct name -> treat as generic param, accept anything */
+            return 1;
+        default:          return 1;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Function invocation (Step 6 + closures)                             */
+/* ------------------------------------------------------------------ */
+
+static Value call_function(Interp *it, int line, Value fn, Value *args, int argc,
+                           char **arg_names) {
+    (void)arg_names;
+    if (fn.type != TYPE_FUNC)
+        runtime_error(it, line, "attempt to call a non-function value (%s)", type_name(fn.type));
+
+    FuncDecl *fd = fn.as.obj->as.fn.decl;
+    if (argc != fd->param_count)
+        runtime_error(it, line, "function '%s' expects %d argument(s), got %d",
+                      fd->name ? fd->name : "<lambda>", fd->param_count, argc);
+
+    Env *call_env = env_new(fn.as.obj->as.fn.closure);
+
+    /* bind self for methods */
+    if (fn.as.obj->as.fn.is_bound && fn.as.obj->as.fn.bound_self) {
+        env_define(call_env, "self", value_copy(fn.as.obj->as.fn.bound_self));
+    }
+
+    /* bind parameters with type-checking (spec 6.1: annotations required) */
+    for (int i = 0; i < argc; i++) {
+        if (!typespec_matches_value(it, fd->params[i].type, &args[i])) {
+            char *want = typespec_to_cstr(fd->params[i].type);
+            const char *got = value_type_name(&args[i]);
+            env_free(call_env);
+            runtime_error(it, line,
+                "argument %d of '%s' expects %s, got %s",
+                i + 1, fd->name ? fd->name : "<lambda>", want, got);
+        }
+        env_define(call_env, fd->params[i].name, value_copy(&args[i]));
+    }
+
+    /* run body */
+    Value *saved_ret = it->ret_values;
+    int    saved_cnt = it->ret_count;
+    it->ret_values = NULL;
+    it->ret_count = 0;
+
+    Flow f = exec_block(it, call_env, fd->body);
+
+    Value result;
+    if (f == FLOW_RETURN) {
+        if (it->ret_count == 0) {
+            result = value_void();
+        } else if (it->ret_count == 1) {
+            result = it->ret_values[0];
+        } else {
+            /* multiple returns -> pack into an array-like tuple.
+             * We represent the tuple with a special array so multi-assignment
+             * can unpack it. */
+            Value tup = value_array(NULL);
+            for (int i = 0; i < it->ret_count; i++)
+                array_push(&tup, it->ret_values[i]);
+            result = tup;
+        }
+        free(it->ret_values);
+    } else {
+        result = value_void();
+    }
+
+    it->ret_values = saved_ret;
+    it->ret_count = saved_cnt;
+
+    env_free(call_env);
+    return result;
+}
+
 /* ------------------------------------------------------------------ */
 /* Expression evaluation                                               */
 /* ------------------------------------------------------------------ */
+
+static Value eval_call(Interp *it, Env *env, Expr *e) {
+    Expr *callee = e->as.call.callee;
+    int line = e->line;
+
+    /* builtin ident callees */
+    if (callee->kind == EXPR_IDENT) {
+        const char *name = callee->as.ident;
+        if (strcmp(name, "myon.print") == 0) return builtin_print(it, env, e);
+        if (strcmp(name, "myon.input") == 0) return builtin_input(it, env, e);
+        /* stdlib namespaced calls (myon.math.* / myon.string.*) */
+        if (strncmp(name, "myon.", 5) == 0) {
+            Value out;
+            if (call_stdlib(it, env, name, e, &out)) return out;
+        }
+        /* struct constructor: Name(field=...) */
+        StructDecl *sd = find_struct(it, name);
+        if (sd)
+            return construct_struct(it, env, e, sd, NULL, 0);
+    }
+
+    /* generic constructor: Name<T>(...) */
+    if (callee->kind == EXPR_GENERIC) {
+        StructDecl *sd = find_struct(it, callee->as.generic.name);
+        if (sd)
+            return construct_struct(it, env, e, sd,
+                                    callee->as.generic.args,
+                                    callee->as.generic.arg_count);
+        runtime_error(it, line, "unknown generic type '%s'", callee->as.generic.name);
+    }
+
+    /* method call: obj.method(args) */
+    if (callee->kind == EXPR_MEMBER) {
+        Value recv = eval_expr(it, env, callee->as.member.target);
+        Value r = call_method(it, env, e, recv, callee->as.member.name);
+        value_free(&recv);
+        return r;
+    }
+
+    /* first-class function value (variable holding a func / lambda) */
+    Value fn = eval_expr(it, env, callee);
+    if (fn.type == TYPE_FUNC) {
+        int argc = e->as.call.arg_count;
+        Value *args = argc ? (Value *)myon_xmalloc(sizeof(Value) * argc) : NULL;
+        for (int i = 0; i < argc; i++)
+            args[i] = eval_expr(it, env, e->as.call.args[i]);
+        Value r = call_function(it, line, fn, args, argc, e->as.call.arg_names);
+        for (int i = 0; i < argc; i++) value_free(&args[i]);
+        free(args);
+        value_free(&fn);
+        return r;
+    }
+    value_free(&fn);
+    runtime_error(it, line, "call of unsupported callee");
+    return value_nil();
+}
 
 static Value eval_expr(Interp *it, Env *env, Expr *e) {
     switch (e->kind) {
         case EXPR_INT_LIT:   return value_int(e->as.int_val);
         case EXPR_FLOAT_LIT: return value_float(e->as.float_val);
         case EXPR_BOOL_LIT:  return value_bool(e->as.bool_val);
-        case EXPR_STRING:    return value_str(myon_strdup(e->as.str_val));
+        case EXPR_STRING:    return interpolate_string(it, env, e->line, e->as.str_val);
         case EXPR_NIL:       return value_nil();
 
         case EXPR_IDENT: {
@@ -293,27 +852,51 @@ static Value eval_expr(Interp *it, Env *env, Expr *e) {
             return cast_to_char(it, e->line, eval_expr(it, env, e->as.operand));
         case EXPR_ERROR_CTOR: {
             Value v = eval_expr(it, env, e->as.operand);
-            if (v.type != TYPE_STR)
+            if (v.type != TYPE_STR) {
+                value_free(&v);
                 runtime_error(it, e->line, "error() expects a str argument");
-            char *msg = myon_strdup(v.as.s);
+            }
+            char *msg = myon_strdup(v.as.obj->as.str);
             value_free(&v);
             return value_error(msg);
+        }
+
+        case EXPR_ARRAY_CTOR:
+            return value_array(typespec_clone(e->as.array_elem));
+        case EXPR_MAP_CTOR:
+            return value_map(typespec_clone(e->as.map_types.key),
+                             typespec_clone(e->as.map_types.val));
+
+        case EXPR_LAMBDA:
+            /* capture the current environment as the closure */
+            return value_func(e->as.lambda, env);
+
+        case EXPR_AWAIT: {
+            /* pseudo-async: await simply evaluates the (already-run) value */
+            return eval_expr(it, env, e->as.operand);
+        }
+
+        case EXPR_GENERIC: {
+            /* a generic name used without a call — treat as a struct ctor ref
+             * is invalid here; only meaningful inside a call. */
+            runtime_error(it, e->line, "generic type '%s' must be instantiated with (...)",
+                          e->as.generic.name);
+            return value_nil();
         }
 
         case EXPR_UNARY: {
             Value v = eval_expr(it, env, e->as.unary.operand);
             if (e->as.unary.op == OP_NEG) {
-                if (v.type == TYPE_INT)   { long long r = -v.as.i; return value_int(r); }
-                if (v.type == TYPE_FLOAT) { double r = -v.as.f; return value_float(r); }
+                if (v.type == TYPE_INT)   return value_int(-v.as.i);
+                if (v.type == TYPE_FLOAT) return value_float(-v.as.f);
                 Type t = v.type; value_free(&v);
                 runtime_error(it, e->line, "unary '-' requires int or float, got %s", type_name(t));
-            } else { /* OP_NOT */
+            } else {
                 if (v.type != TYPE_BOOL) {
                     Type t = v.type; value_free(&v);
                     runtime_error(it, e->line, "myon.not requires bool, got %s", type_name(t));
                 }
-                int r = !v.as.b;
-                return value_bool(r);
+                return value_bool(!v.as.b);
             }
             return value_nil();
         }
@@ -324,7 +907,6 @@ static Value eval_expr(Interp *it, Env *env, Expr *e) {
                 Type t = l.type; value_free(&l);
                 runtime_error(it, e->line, "logical operator requires bool, got %s", type_name(t));
             }
-            /* short-circuit */
             if (e->as.binary.op == OP_AND && !l.as.b) return value_bool(0);
             if (e->as.binary.op == OP_OR  &&  l.as.b) return value_bool(1);
             Value r = eval_expr(it, env, e->as.binary.right);
@@ -341,103 +923,260 @@ static Value eval_expr(Interp *it, Env *env, Expr *e) {
             return eval_binary(it, e->line, e->as.binary.op, l, r);
         }
 
-        case EXPR_CALL: {
-            /* Only myon.print is a callable in Steps 0-5. */
-            Expr *callee = e->as.call.callee;
-            if (callee->kind == EXPR_IDENT && callee->as.ident) {
-                /* the compound "myon.print" token becomes ident "myon.print"?
-                 * No — it is a dedicated token, handled below via member form. */
+        case EXPR_CALL:
+            return eval_call(it, env, e);
+
+        case EXPR_INDEX: {
+            Value target = eval_expr(it, env, e->as.index.target);
+            Value idx = eval_expr(it, env, e->as.index.index);
+            if (target.type == TYPE_ARRAY) {
+                if (idx.type != TYPE_INT) {
+                    value_free(&target); value_free(&idx);
+                    runtime_error(it, e->line, "array index must be int");
+                }
+                ArrayData *a = &target.as.obj->as.arr;
+                long long i = idx.as.i;
+                if (i < 0 || i >= a->count) {
+                    value_free(&target); value_free(&idx);
+                    runtime_error(it, e->line, "array index %lld out of bounds (length %d)", i, a->count);
+                }
+                Value r = value_copy(&a->items[i]);
+                value_free(&target); value_free(&idx);
+                return r;
             }
-            runtime_error(it, e->line, "call of unsupported callee (only myon.print supported so far)");
+            if (target.type == TYPE_MAP) {
+                Value out;
+                int ok = map_get(&target, &idx, &out);
+                value_free(&target); value_free(&idx);
+                if (!ok) return value_nil();
+                return out;
+            }
+            value_free(&target); value_free(&idx);
+            runtime_error(it, e->line, "cannot index type");
             return value_nil();
         }
 
-        case EXPR_INDEX:
-            runtime_error(it, e->line, "indexing is not supported yet (Step 7)");
+        case EXPR_MEMBER: {
+            Value target = eval_expr(it, env, e->as.member.target);
+            if (target.type == TYPE_STRUCT) {
+                Value *fp = struct_field_ptr(&target, e->as.member.name);
+                if (!fp) {
+                    const char *tn = target.as.obj->as.st.type_name;
+                    value_free(&target);
+                    runtime_error(it, e->line, "struct '%s' has no field '%s'",
+                                  tn, e->as.member.name);
+                }
+                Value r = value_copy(fp);
+                value_free(&target);
+                return r;
+            }
+            value_free(&target);
+            runtime_error(it, e->line, "member access on non-struct value");
             return value_nil();
-
-        case EXPR_MEMBER:
-            runtime_error(it, e->line, "member access is not supported yet");
-            return value_nil();
+        }
     }
     runtime_error(it, e->line, "unknown expression kind");
     return value_nil();
 }
 
 /* ------------------------------------------------------------------ */
+/* Assignment to member / index targets                                */
+/* ------------------------------------------------------------------ */
+
+static void assign_target(Interp *it, Env *env, Expr *target, Value v) {
+    int line = target->line;
+    if (target->kind == EXPR_MEMBER) {
+        Value obj = eval_expr(it, env, target->as.member.target);
+        if (obj.type != TYPE_STRUCT) {
+            value_free(&obj); value_free(&v);
+            runtime_error(it, line, "cannot set field on non-struct");
+        }
+        Value *fp = struct_field_ptr(&obj, target->as.member.name);
+        if (!fp) {
+            const char *tn = obj.as.obj->as.st.type_name;
+            value_free(&obj); value_free(&v);
+            runtime_error(it, line, "struct '%s' has no field '%s'", tn, target->as.member.name);
+        }
+        value_free(fp);
+        *fp = v;               /* obj shares the same Obj, mutation is visible */
+        value_free(&obj);
+        return;
+    }
+    if (target->kind == EXPR_INDEX) {
+        Value obj = eval_expr(it, env, target->as.index.target);
+        Value idx = eval_expr(it, env, target->as.index.index);
+        if (obj.type == TYPE_ARRAY) {
+            if (idx.type != TYPE_INT) { value_free(&obj); value_free(&idx); value_free(&v); runtime_error(it, line, "array index must be int"); }
+            ArrayData *a = &obj.as.obj->as.arr;
+            long long i = idx.as.i;
+            if (i < 0 || i >= a->count) { value_free(&obj); value_free(&idx); value_free(&v); runtime_error(it, line, "array index out of bounds"); }
+            value_free(&a->items[i]);
+            a->items[i] = v;
+            value_free(&obj); value_free(&idx);
+            return;
+        }
+        if (obj.type == TYPE_MAP) {
+            map_set(&obj, idx, v);   /* takes ownership of idx and v */
+            value_free(&obj);
+            return;
+        }
+        value_free(&obj); value_free(&idx); value_free(&v);
+        runtime_error(it, line, "cannot index-assign to this type");
+    }
+    value_free(&v);
+    runtime_error(it, line, "invalid assignment target");
+}
+
+/* ------------------------------------------------------------------ */
 /* Statement execution                                                 */
 /* ------------------------------------------------------------------ */
 
-/* Handle the special case where the parser produced a myon.print call.
- * The lexer tokenises "myon.print" as a single keyword; the parser turns
- * it into an EXPR_CALL whose callee is an EXPR_IDENT? No — myon.print is a
- * primary via the keyword path. To keep Steps 0-5 self-contained we detect
- * print at the expression-statement level. */
-static int try_exec_print(Interp *it, Env *env, Expr *e) {
-    if (e->kind != EXPR_CALL) return 0;
-    Expr *callee = e->as.call.callee;
-    if (callee->kind == EXPR_IDENT && strcmp(callee->as.ident, "myon.print") == 0) {
-        Value v = builtin_print(it, env, e);
+static Flow do_multi_assign(Interp *it, Env *env, Stmt *s, Value v) {
+    /* v must be a tuple (array with NULL elem_type) from a multi-return */
+    int total = 1 + s->as.assign.extra_count;
+    if (v.type != TYPE_ARRAY || v.as.obj->as.arr.elem_type != NULL) {
         value_free(&v);
-        return 1;
+        runtime_error(it, s->line,
+            "multiple-target assignment requires a multi-value return (spec 6.2)");
     }
-    return 0;
+    ArrayData *a = &v.as.obj->as.arr;
+    if (a->count != total) {
+        value_free(&v);
+        runtime_error(it, s->line,
+            "assignment target count (%d) does not match return count (%d)",
+            total, a->count);
+    }
+    /* names[0] = name, names[1..] = extra_names */
+    for (int i = 0; i < total; i++) {
+        const char *nm = (i == 0) ? s->as.assign.name : s->as.assign.extra_names[i - 1];
+        Value elem = value_copy(&a->items[i]);
+        if (env_defined_local(env, nm)) env_set(env, nm, elem);
+        else                            env_define(env, nm, elem);
+    }
+    value_free(&v);
+    return FLOW_NORMAL;
 }
 
 static Flow exec_stmt(Interp *it, Env *env, Stmt *s) {
     switch (s->kind) {
         case STMT_SYSTEM:
+            return FLOW_NORMAL;
         case STMT_MODULE:
-            /* Declarations: no runtime effect in Steps 0-5. */
+            /* module loading handled in interpret() preamble; no-op here */
             return FLOW_NORMAL;
 
+        case STMT_FUNC: {
+            const char *nm = s->as.func->name;
+            /* Top-level functions are hoisted during prescan; when we reach
+             * the declaration statement again it is already bound to exactly
+             * this decl, so treat it as a no-op. A nested function declaration
+             * (inside a block/loop/function) is defined here on first sight. */
+            if (env_defined_local(env, nm)) {
+                Value existing;
+                env_get(env, nm, &existing);
+                int same = (existing.type == TYPE_FUNC &&
+                            existing.as.obj->as.fn.decl == s->as.func);
+                value_free(&existing);
+                if (same) return FLOW_NORMAL;
+                runtime_error(it, s->line,
+                    "redefinition of '%s' (shadowing is forbidden, spec 9.2)", nm);
+            }
+            env_define(env, nm, value_func(s->as.func, env));
+            return FLOW_NORMAL;
+        }
+
+        case STMT_STRUCT:
+            /* registration is done in the preamble; ignore here */
+            return FLOW_NORMAL;
+
+        case STMT_RETURN: {
+            int n = s->as.ret.count;
+            it->ret_values = n ? (Value *)myon_xmalloc(sizeof(Value) * n) : NULL;
+            it->ret_count = n;
+            for (int i = 0; i < n; i++)
+                it->ret_values[i] = eval_expr(it, env, s->as.ret.values[i]);
+            return FLOW_RETURN;
+        }
+
         case STMT_ASSIGN: {
+            /* target assignment (a.b = v / a[i] = v) */
+            if (s->as.assign.target) {
+                if (s->as.assign.is_compound) {
+                    Value cur = eval_expr(it, env, s->as.assign.target);
+                    Value rhs = eval_expr(it, env, s->as.assign.value);
+                    Value res = eval_binary(it, s->line, s->as.assign.compound, cur, rhs);
+                    assign_target(it, env, s->as.assign.target, res);
+                } else {
+                    Value v = eval_expr(it, env, s->as.assign.value);
+                    assign_target(it, env, s->as.assign.target, v);
+                }
+                return FLOW_NORMAL;
+            }
+
             Value v = eval_expr(it, env, s->as.assign.value);
 
             if (s->as.assign.is_compound) {
                 Value cur;
-                if (!env_get(env, s->as.assign.name, &cur))
+                if (!env_get(env, s->as.assign.name, &cur)) {
+                    value_free(&v);
                     runtime_error(it, s->line, "compound assignment to undefined variable '%s'",
                                   s->as.assign.name);
+                }
                 Value res = eval_binary(it, s->line, s->as.assign.compound, cur, v);
                 if (!env_set(env, s->as.assign.name, res))
                     runtime_error(it, s->line, "failed to assign '%s'", s->as.assign.name);
                 return FLOW_NORMAL;
             }
 
-            /* nil is only valid for the error type (spec 2.4) */
-            if (v.type == TYPE_NIL)
+            /* multiple-target assignment */
+            if (s->as.assign.extra_count > 0)
+                return do_multi_assign(it, env, s, v);
+
+            if (v.type == TYPE_NIL) {
+                value_free(&v);
                 runtime_error(it, s->line,
                     "cannot assign myon.nil to a normal variable (spec 2.4)");
+            }
 
-            /* optional type annotation check (spec 14.7 allows omission) */
             if (s->as.assign.has_type &&
-                !type_equal(s->as.assign.annotated, v.type)) {
-                Type want = s->as.assign.annotated, got = v.type;
+                !typespec_matches_value(it, s->as.assign.annotated, &v)) {
+                char *want = typespec_to_cstr(s->as.assign.annotated);
+                const char *got = value_type_name(&v);
                 value_free(&v);
                 runtime_error(it, s->line,
                     "type annotation mismatch: '%s' declared %s but value is %s",
-                    s->as.assign.name, type_name(want), type_name(got));
+                    s->as.assign.name, want, got);
             }
 
-            if (s->as.assign.extra_count > 0) {
-                value_free(&v);
-                runtime_error(it, s->line,
-                    "multiple-target assignment requires multiple return values (Step 6)");
-            }
-
-            /* Define if new, otherwise re-assign. Shadowing rules land in Step 8. */
+            /* Assignment / shadowing rules (spec 9.2):
+             *  - re-assignment to a name already bound (locally or in an
+             *    enclosing scope) updates that binding.
+             *  - inside an explicit `{ }` block, introducing a name that
+             *    already exists in an outer scope is forbidden (shadowing).
+             */
             if (env_defined_local(env, s->as.assign.name)) {
                 env_set(env, s->as.assign.name, v);
             } else {
-                env_define(env, s->as.assign.name, v);
+                Value tmp;
+                int outer = (env->parent && env_get(env->parent, s->as.assign.name, &tmp));
+                if (outer) value_free(&tmp);
+                if (outer && env->is_block) {
+                    value_free(&v);
+                    runtime_error(it, s->line,
+                        "redefinition of '%s' shadows an outer variable (forbidden, spec 9.2)",
+                        s->as.assign.name);
+                }
+                if (outer) {
+                    /* assign through to the existing outer binding */
+                    env_set(env, s->as.assign.name, v);
+                } else {
+                    env_define(env, s->as.assign.name, v);
+                }
             }
             return FLOW_NORMAL;
         }
 
         case STMT_EXPR: {
-            if (try_exec_print(it, env, s->as.expr))
-                return FLOW_NORMAL;
             Value v = eval_expr(it, env, s->as.expr);
             value_free(&v);
             return FLOW_NORMAL;
@@ -450,20 +1189,31 @@ static Flow exec_stmt(Interp *it, Env *env, Stmt *s) {
                 runtime_error(it, s->line, "if condition must be bool, got %s", type_name(t));
             }
             int taken = c.as.b;
-            if (taken)
-                return exec_block(it, env, &s->as.if_stmt.then_body);
-
+            if (taken) {
+                Env *sc = env_new(env);
+                Flow f = exec_block(it, sc, &s->as.if_stmt.then_body);
+                env_free(sc);
+                return f;
+            }
             for (int i = 0; i < s->as.if_stmt.elif_count; i++) {
                 Value ec = eval_expr(it, env, s->as.if_stmt.elifs[i].cond);
                 if (ec.type != TYPE_BOOL) {
                     Type t = ec.type; value_free(&ec);
                     runtime_error(it, s->line, "elif condition must be bool, got %s", type_name(t));
                 }
-                if (ec.as.b)
-                    return exec_block(it, env, &s->as.if_stmt.elifs[i].body);
+                if (ec.as.b) {
+                    Env *sc = env_new(env);
+                    Flow f = exec_block(it, sc, &s->as.if_stmt.elifs[i].body);
+                    env_free(sc);
+                    return f;
+                }
             }
-            if (s->as.if_stmt.has_else)
-                return exec_block(it, env, &s->as.if_stmt.else_body);
+            if (s->as.if_stmt.has_else) {
+                Env *sc = env_new(env);
+                Flow f = exec_block(it, sc, &s->as.if_stmt.else_body);
+                env_free(sc);
+                return f;
+            }
             return FLOW_NORMAL;
         }
 
@@ -475,35 +1225,52 @@ static Flow exec_stmt(Interp *it, Env *env, Stmt *s) {
                     runtime_error(it, s->line, "while condition must be bool, got %s", type_name(t));
                 }
                 if (!c.as.b) break;
-                Flow f = exec_block(it, env, &s->as.while_stmt.body);
+                Env *sc = env_new(env);
+                Flow f = exec_block(it, sc, &s->as.while_stmt.body);
+                env_free(sc);
                 if (f == FLOW_BREAK) break;
-                /* FLOW_CONTINUE and FLOW_NORMAL both loop again */
+                if (f == FLOW_RETURN) return f;
             }
             return FLOW_NORMAL;
         }
 
         case STMT_FOR: {
-            if (!s->as.for_stmt.is_range)
-                runtime_error(it, s->line,
-                    "for-in over arrays is not supported yet (Step 7); use range(...)");
-
-            Value start = eval_expr(it, env, s->as.for_stmt.range_start);
-            Value end   = eval_expr(it, env, s->as.for_stmt.range_end);
-            if (start.type != TYPE_INT || end.type != TYPE_INT) {
-                Type st = start.type, et = end.type;
-                value_free(&start); value_free(&end);
-                runtime_error(it, s->line, "range(...) requires int bounds, got %s and %s",
-                              type_name(st), type_name(et));
+            if (s->as.for_stmt.is_range) {
+                Value start = eval_expr(it, env, s->as.for_stmt.range_start);
+                Value end   = eval_expr(it, env, s->as.for_stmt.range_end);
+                if (start.type != TYPE_INT || end.type != TYPE_INT) {
+                    Type st = start.type, et = end.type;
+                    value_free(&start); value_free(&end);
+                    runtime_error(it, s->line, "range(...) requires int bounds, got %s and %s",
+                                  type_name(st), type_name(et));
+                }
+                long long lo = start.as.i, hi = end.as.i;
+                for (long long i = lo; i < hi; i++) {
+                    Env *loop = env_new(env);
+                    env_define(loop, s->as.for_stmt.var, value_int(i));
+                    Flow f = exec_block(it, loop, &s->as.for_stmt.body);
+                    env_free(loop);
+                    if (f == FLOW_BREAK) break;
+                    if (f == FLOW_RETURN) return f;
+                }
+                return FLOW_NORMAL;
             }
-            long long lo = start.as.i, hi = end.as.i;
-
-            for (long long i = lo; i < hi; i++) {
+            /* for-in over an array (spec 5.2 / 7) */
+            Value iter = eval_expr(it, env, s->as.for_stmt.iterable);
+            if (iter.type != TYPE_ARRAY) {
+                Type t = iter.type; value_free(&iter);
+                runtime_error(it, s->line, "myon.for ... myon.in requires an array, got %s", type_name(t));
+            }
+            ArrayData *a = &iter.as.obj->as.arr;
+            for (int i = 0; i < a->count; i++) {
                 Env *loop = env_new(env);
-                env_define(loop, s->as.for_stmt.var, value_int(i));
+                env_define(loop, s->as.for_stmt.var, value_copy(&a->items[i]));
                 Flow f = exec_block(it, loop, &s->as.for_stmt.body);
                 env_free(loop);
                 if (f == FLOW_BREAK) break;
+                if (f == FLOW_RETURN) { value_free(&iter); return f; }
             }
+            value_free(&iter);
             return FLOW_NORMAL;
         }
 
@@ -512,19 +1279,32 @@ static Flow exec_stmt(Interp *it, Env *env, Stmt *s) {
 
         case STMT_BLOCK: {
             Env *scope = env_new(env);
+            scope->is_block = 1;
             Flow f = exec_block(it, scope, &s->as.block);
             env_free(scope);
             return f;
         }
 
-        case STMT_EXPOSE:
-            /* Full semantics arrive in Step 8; accept syntactically. */
+        case STMT_EXPOSE: {
+            /* copy the named binding from this scope into the parent (spec 9.1) */
+            Value v;
+            if (!env_get(env, s->as.expose_name, &v))
+                runtime_error(it, s->line, "myon.expose: '%s' is not defined here",
+                              s->as.expose_name);
+            if (env->parent) {
+                if (env_defined_local(env->parent, s->as.expose_name))
+                    env_set(env->parent, s->as.expose_name, v);
+                else
+                    env_define(env->parent, s->as.expose_name, v);
+            } else {
+                value_free(&v);
+            }
             return FLOW_NORMAL;
+        }
     }
     return FLOW_NORMAL;
 }
 
-/* Execute a statement list, propagating break/continue upward. */
 static Flow exec_block(Interp *it, Env *env, StmtList *body) {
     for (int i = 0; i < body->count; i++) {
         Flow f = exec_stmt(it, env, body->items[i]);
@@ -534,27 +1314,201 @@ static Flow exec_block(Interp *it, Env *env, StmtList *body) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Module loading (Step 11)                                            */
+/* ------------------------------------------------------------------ */
+
+static const char *BUILTIN_MODULES[] = {
+    "myon.stdio", "myon.math", "myon.string", NULL
+};
+
+static int is_builtin_module(const char *path) {
+    for (int i = 0; BUILTIN_MODULES[i]; i++)
+        if (strcmp(BUILTIN_MODULES[i], path) == 0) return 1;
+    return 0;
+}
+
+static ModuleEntry *find_module(Interp *it, const char *path) {
+    for (ModuleEntry *m = it->modules; m; m = m->next)
+        if (strcmp(m->path, path) == 0) return m;
+    return NULL;
+}
+
+/* register + pre-scan a program's top-level struct/function declarations */
+static void prescan(Interp *it, Env *env, Program *prog);
+
+static int load_external_module(Interp *it, Stmt *decl);
+
+static void handle_module_decl(Interp *it, Stmt *s) {
+    const char *path = s->as.module_decl.path;
+    if (is_builtin_module(path)) {
+        /* builtin: just record it */
+        ModuleEntry *m = (ModuleEntry *)myon_xmalloc(sizeof(ModuleEntry));
+        m->path = myon_strdup(path);
+        m->alias = s->as.module_decl.alias ? myon_strdup(s->as.module_decl.alias) : NULL;
+        m->loading = 0;
+        m->next = it->modules;
+        it->modules = m;
+        return;
+    }
+    /* external module: external.util.math -> ./util/math.myon */
+    load_external_module(it, s);
+}
+
+static int load_external_module(Interp *it, Stmt *decl) {
+    const char *path = decl->as.module_decl.path;
+
+    ModuleEntry *existing = find_module(it, path);
+    if (existing) {
+        if (existing->loading)
+            runtime_error(it, decl->line, "circular module import detected: '%s' (spec 14.5)", path);
+        return 1; /* already loaded */
+    }
+
+    ModuleEntry *m = (ModuleEntry *)myon_xmalloc(sizeof(ModuleEntry));
+    m->path = myon_strdup(path);
+    m->alias = decl->as.module_decl.alias ? myon_strdup(decl->as.module_decl.alias) : NULL;
+    m->loading = 1;
+    m->next = it->modules;
+    it->modules = m;
+
+    /* build file path: strip leading "external." then dots -> '/' + .myon */
+    const char *p = path;
+    if (strncmp(p, "external.", 9) == 0) p += 9;
+    char file[512];
+    size_t len = 0;
+    file[0] = '\0';
+    len += (size_t)snprintf(file + len, sizeof(file) - len, "./");
+    for (const char *c = p; *c; c++)
+        file[len++] = (*c == '.') ? '/' : *c;
+    file[len] = '\0';
+    snprintf(file + len, sizeof(file) - len, ".myon");
+
+    FILE *f = fopen(file, "rb");
+    if (!f)
+        runtime_error(it, decl->line, "cannot open module file '%s' for '%s'", file, path);
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *src = (char *)myon_xmalloc((size_t)sz + 1);
+    size_t n = fread(src, 1, (size_t)sz, f);
+    src[n] = '\0';
+    fclose(f);
+
+    TokenList tl;
+    if (!lexer_tokenize(src, &tl)) { free(src); runtime_error(it, decl->line, "lex error in module '%s'", path); }
+    Program *mp = parser_parse(&tl);
+    if (!mp) { token_list_free(&tl); free(src); runtime_error(it, decl->line, "parse error in module '%s'", path); }
+
+    /* execute module top-level into the global scope (simple namespace model) */
+    prescan(it, it->global, mp);
+    for (int i = 0; i < mp->stmts.count; i++) {
+        if (mp->stmts.items[i]->kind == STMT_MODULE)
+            handle_module_decl(it, mp->stmts.items[i]);
+        else
+            exec_stmt(it, it->global, mp->stmts.items[i]);
+    }
+
+    /* NOTE: module AST is intentionally leaked for the lifetime of the run,
+     * because function/struct values captured from it reference its nodes.
+     * A production implementation would track and free these at shutdown. */
+    (void)mp;
+    token_list_free(&tl);
+    free(src);
+
+    m->loading = 0;
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Pre-scan: hoist struct + function declarations                      */
+/* ------------------------------------------------------------------ */
+
+static void prescan(Interp *it, Env *env, Program *prog) {
+    /* First pass: register structs so constructors/type refs resolve. */
+    for (int i = 0; i < prog->stmts.count; i++) {
+        Stmt *s = prog->stmts.items[i];
+        if (s->kind == STMT_STRUCT) {
+            StructDecl *sd = s->as.struct_decl;
+            if (find_struct(it, sd->name))
+                runtime_error(it, s->line, "redefinition of struct '%s'", sd->name);
+            register_struct(it, sd);
+        }
+    }
+    /* resolve parents + check field-name collisions (spec 14.6) */
+    for (int i = 0; i < it->structs.count; i++) {
+        StructDecl *sd = it->structs.items[i];
+        if (sd->parent_name && !sd->parent) {
+            sd->parent = find_struct(it, sd->parent_name);
+            if (!sd->parent)
+                runtime_error(it, 0, "struct '%s' extends unknown struct '%s'",
+                              sd->name, sd->parent_name);
+            /* field collision check */
+            for (int a = 0; a < sd->field_count; a++)
+                for (StructDecl *pc = sd->parent; pc; pc = pc->parent)
+                    for (int b = 0; b < pc->field_count; b++)
+                        if (strcmp(sd->fields[a].name, pc->fields[b].name) == 0)
+                            runtime_error(it, 0,
+                                "field '%s' in struct '%s' collides with parent (spec 14.6)",
+                                sd->fields[a].name, sd->name);
+        }
+    }
+    /* Second pass: hoist top-level functions so they can be mutually recursive. */
+    for (int i = 0; i < prog->stmts.count; i++) {
+        Stmt *s = prog->stmts.items[i];
+        if (s->kind == STMT_FUNC) {
+            const char *nm = s->as.func->name;
+            if (!env_defined_local(env, nm))
+                env_define(env, nm, value_func(s->as.func, env));
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Entry point                                                         */
 /* ------------------------------------------------------------------ */
 
 int interpret(Program *program) {
     Interp it;
+    memset(&it, 0, sizeof(it));
     it.global = env_new(NULL);
 
     if (setjmp(it.on_error)) {
         env_free(it.global);
+        free(it.structs.items);
+        ModuleEntry *m = it.modules;
+        while (m) { ModuleEntry *n = m->next; free(m->path); free(m->alias); free(m); m = n; }
         return 1;
     }
 
+    /* load modules first (so external decls hoist) */
+    for (int i = 0; i < program->stmts.count; i++)
+        if (program->stmts.items[i]->kind == STMT_MODULE)
+            handle_module_decl(&it, program->stmts.items[i]);
+
+    /* hoist struct/function declarations */
+    prescan(&it, it.global, program);
+
     for (int i = 0; i < program->stmts.count; i++) {
-        Flow f = exec_stmt(&it, it.global, program->stmts.items[i]);
+        Stmt *s = program->stmts.items[i];
+        if (s->kind == STMT_MODULE) continue; /* already handled */
+        Flow f = exec_stmt(&it, it.global, s);
         if (f == FLOW_BREAK || f == FLOW_CONTINUE) {
             fprintf(stderr, "myon: runtime error: break/continue outside of a loop\n");
             env_free(it.global);
+            free(it.structs.items);
             return 1;
+        }
+        if (f == FLOW_RETURN) {
+            /* top-level ret: ignore returned values */
+            for (int k = 0; k < it.ret_count; k++) value_free(&it.ret_values[k]);
+            free(it.ret_values);
+            it.ret_values = NULL; it.ret_count = 0;
         }
     }
 
     env_free(it.global);
+    free(it.structs.items);
+    ModuleEntry *m = it.modules;
+    while (m) { ModuleEntry *n = m->next; free(m->path); free(m->alias); free(m); m = n; }
     return 0;
 }

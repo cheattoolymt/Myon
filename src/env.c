@@ -24,6 +24,7 @@ Env *env_new(Env *parent) {
     Env *e = (Env *)myon_xmalloc(sizeof(Env));
     e->head = NULL;
     e->parent = parent;
+    e->is_block = 0;
     return e;
 }
 

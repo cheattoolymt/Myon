@@ -1,0 +1,8 @@
+module myon.stdio
+x = 1
+{
+    y = 2
+    myon.expose y
+}
+myon.print(y)
+myon.print(x)

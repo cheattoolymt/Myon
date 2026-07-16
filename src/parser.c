@@ -22,29 +22,27 @@
 #include <string.h>
 #include <setjmp.h>
 
-/* ------------------------------------------------------------------ */
-/* Parser state                                                        */
-/* ------------------------------------------------------------------ */
-
 typedef struct {
     const Token *toks;
     int          count;
     int          pos;
-    jmp_buf      escape;   /* longjmp target on syntax error */
+    jmp_buf      escape;
+    int          suppress_errors; /* >0 while doing speculative parsing */
 } Parser;
 
 static Expr *parse_expression(Parser *p);
 static void  parse_block(Parser *p, StmtList *out);
 static Stmt *parse_statement(Parser *p);
+static TypeSpec *parse_type(Parser *p);
+static FuncDecl *parse_func_decl(Parser *p, int is_async);
 
 /* ---- token access ---- */
-
 static const Token *peek(Parser *p)  { return &p->toks[p->pos]; }
 static const Token *prev(Parser *p)  { return &p->toks[p->pos - 1]; }
 static TokenType    cur(Parser *p)   { return p->toks[p->pos].type; }
+static TokenType    peek_type(Parser *p, int k) { return p->toks[p->pos + k].type; }
 static int          at_eof(Parser *p){ return cur(p) == TOK_EOF; }
-
-static int check(Parser *p, TokenType t) { return cur(p) == t; }
+static int          check(Parser *p, TokenType t) { return cur(p) == t; }
 
 static const Token *advance(Parser *p) {
     if (!at_eof(p)) p->pos++;
@@ -57,27 +55,31 @@ static int match(Parser *p, TokenType t) {
 }
 
 static void perror_at(Parser *p, const Token *t, const char *msg) {
-    fprintf(stderr, "myon: syntax error at line %d: %s (got '%s')\n",
-            t->line, msg, token_type_name(t->type));
+    /* During speculative parsing (e.g. distinguishing a generic
+     * instantiation "Foo<int>(...)" from the comparison "i < 10") a failed
+     * parse is expected and recovered from, so don't leak its diagnostic. */
+    if (p->suppress_errors == 0) {
+        fprintf(stderr, "myon: syntax error at line %d: %s (got '%s')\n",
+                t->line, msg, token_type_name(t->type));
+    }
     longjmp(p->escape, 1);
 }
 
 static const Token *expect(Parser *p, TokenType t, const char *msg) {
     if (check(p, t)) return advance(p);
     perror_at(p, peek(p), msg);
-    return NULL; /* unreachable */
+    return NULL;
 }
 
-/* skip newline / semicolon statement separators */
 static void skip_terminators(Parser *p) {
     while (check(p, TOK_NEWLINE) || check(p, TOK_SEMICOLON)) advance(p);
 }
 
 /* ------------------------------------------------------------------ */
-/* Type parsing (subset needed for Steps 0-5)                          */
+/* Type parsing (spec 13 `type`)                                       */
 /* ------------------------------------------------------------------ */
 
-static Type token_to_type(TokenType t) {
+static Type prim_token_to_type(TokenType t) {
     switch (t) {
         case TOK_KW_INT:   return TYPE_INT;
         case TOK_KW_FLOAT: return TYPE_FLOAT;
@@ -90,26 +92,129 @@ static Type token_to_type(TokenType t) {
     }
 }
 
-static Type parse_type(Parser *p) {
-    Type t = token_to_type(cur(p));
-    if (t == TYPE_UNKNOWN)
-        perror_at(p, peek(p), "expected a type name");
-    advance(p);
-    return t;
+/* parse a comma-separated list of types inside < ... > */
+static void parse_type_args(Parser *p, TypeSpec ***args_out, int *count_out) {
+    TypeSpec **args = NULL;
+    int count = 0;
+    expect(p, TOK_LT, "expected '<'");
+    do {
+        TypeSpec *t = parse_type(p);
+        args = (TypeSpec **)myon_xrealloc(args, sizeof(TypeSpec *) * (count + 1));
+        args[count++] = t;
+    } while (match(p, TOK_COMMA));
+    expect(p, TOK_GT, "expected '>' to close type arguments");
+    *args_out = args;
+    *count_out = count;
+}
+
+static TypeSpec *parse_type(Parser *p) {
+    TokenType tt = cur(p);
+    Type prim = prim_token_to_type(tt);
+    if (prim != TYPE_UNKNOWN) {
+        advance(p);
+        return typespec_prim(prim);
+    }
+    if (tt == TOK_MYON_ARRAY) {
+        advance(p);
+        expect(p, TOK_LPAREN, "expected '(' after myon.array");
+        TypeSpec *elem = parse_type(p);
+        expect(p, TOK_RPAREN, "expected ')' after array element type");
+        TypeSpec *ts = typespec_new(TYPE_ARRAY);
+        ts->elem = elem;
+        return ts;
+    }
+    if (tt == TOK_MYON_MAP) {
+        advance(p);
+        expect(p, TOK_LPAREN, "expected '(' after myon.map");
+        TypeSpec *k = parse_type(p);
+        expect(p, TOK_COMMA, "expected ',' in myon.map(K, V)");
+        TypeSpec *v = parse_type(p);
+        expect(p, TOK_RPAREN, "expected ')' after map types");
+        TypeSpec *ts = typespec_new(TYPE_MAP);
+        ts->key = k;
+        ts->elem = v;
+        return ts;
+    }
+    if (tt == TOK_IDENT) {
+        const Token *name = advance(p);
+        TypeSpec *ts = typespec_named(name->lexeme);
+        if (check(p, TOK_LT)) {
+            parse_type_args(p, &ts->args, &ts->arg_count);
+        }
+        return ts;
+    }
+    perror_at(p, peek(p), "expected a type name");
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
 /* Primary / postfix expressions                                       */
 /* ------------------------------------------------------------------ */
 
-/* one of str()/char()/int()/error() value constructors */
 static Expr *parse_ctor(Parser *p, ExprKind kind) {
     int line = peek(p)->line;
-    advance(p); /* the keyword */
+    advance(p);
     expect(p, TOK_LPAREN, "expected '(' after type constructor");
     Expr *inner = parse_expression(p);
     expect(p, TOK_RPAREN, "expected ')' to close constructor");
     return expr_ctor(kind, inner, line);
+}
+
+static void parse_arg_list(Parser *p, CallExpr *call);
+
+/* myon.array(T) or myon.map(K,V) constructors */
+static Expr *parse_array_ctor(Parser *p) {
+    int line = peek(p)->line;
+    advance(p); /* myon.array */
+    expect(p, TOK_LPAREN, "expected '(' after myon.array");
+    TypeSpec *elem = parse_type(p);
+    expect(p, TOK_RPAREN, "expected ')' after array element type");
+    return expr_array_ctor(elem, line);
+}
+
+static Expr *parse_map_ctor(Parser *p) {
+    int line = peek(p)->line;
+    advance(p); /* myon.map */
+    expect(p, TOK_LPAREN, "expected '(' after myon.map");
+    TypeSpec *k = parse_type(p);
+    expect(p, TOK_COMMA, "expected ',' in myon.map(K, V)");
+    TypeSpec *v = parse_type(p);
+    expect(p, TOK_RPAREN, "expected ')' after map types");
+    return expr_map_ctor(k, v, line);
+}
+
+/* myon.lambda(params) ret T { body } */
+static Expr *parse_lambda(Parser *p) {
+    int line = peek(p)->line;
+    advance(p); /* myon.lambda */
+    FuncDecl *fd = (FuncDecl *)myon_xmalloc(sizeof(FuncDecl));
+    memset(fd, 0, sizeof(FuncDecl));
+
+    expect(p, TOK_LPAREN, "expected '(' after myon.lambda");
+    if (!check(p, TOK_RPAREN)) {
+        do {
+            const Token *pn = expect(p, TOK_IDENT, "expected parameter name");
+            expect(p, TOK_COLON, "expected ':' after parameter name");
+            TypeSpec *pt = parse_type(p);
+            fd->params = (Param *)myon_xrealloc(fd->params, sizeof(Param) * (fd->param_count + 1));
+            fd->params[fd->param_count].name = myon_strdup(pn->lexeme);
+            fd->params[fd->param_count].type = pt;
+            fd->param_count++;
+        } while (match(p, TOK_COMMA));
+    }
+    expect(p, TOK_RPAREN, "expected ')' after lambda parameters");
+    expect(p, TOK_KW_RET, "expected 'ret' after lambda parameters");
+    /* one or more return types */
+    do {
+        TypeSpec *rt = parse_type(p);
+        fd->ret_types = (TypeSpec **)myon_xrealloc(fd->ret_types, sizeof(TypeSpec *) * (fd->ret_count + 1));
+        fd->ret_types[fd->ret_count++] = rt;
+    } while (match(p, TOK_COMMA));
+
+    fd->body = (StmtList *)myon_xmalloc(sizeof(StmtList));
+    stmtlist_init(fd->body);
+    parse_block(p, fd->body);
+    return expr_lambda(fd, line);
 }
 
 static Expr *parse_primary(Parser *p) {
@@ -119,7 +224,6 @@ static Expr *parse_primary(Parser *p) {
     switch (t->type) {
         case TOK_INT: {
             advance(p);
-            /* strtoll handles 0x; parse 0o octal manually */
             long long v;
             if (t->lexeme[0] == '0' && (t->lexeme[1] == 'o' || t->lexeme[1] == 'O'))
                 v = strtoll(t->lexeme + 2, NULL, 8);
@@ -140,23 +244,69 @@ static Expr *parse_primary(Parser *p) {
         case TOK_KW_CHAR:  return parse_ctor(p, EXPR_CHAR_CTOR);
         case TOK_KW_INT:   return parse_ctor(p, EXPR_INT_CTOR);
         case TOK_KW_ERROR: return parse_ctor(p, EXPR_ERROR_CTOR);
-        case TOK_IDENT:
+        case TOK_MYON_ARRAY: return parse_array_ctor(p);
+        case TOK_MYON_MAP:   return parse_map_ctor(p);
+        case TOK_MYON_LAMBDA: return parse_lambda(p);
+        case TOK_MYON_AWAIT: {
             advance(p);
+            Expr *inner = parse_expression(p);
+            return expr_await(inner, line);
+        }
+        case TOK_IDENT: {
+            advance(p);
+            /* generic instantiation: Ident < type , ... > ( ... )
+             * Only treat as generic if the '<' is followed by a type and the
+             * matching '>' is immediately followed by '(' (a constructor call)
+             * so we don't misparse the comparison operator. */
+            if (check(p, TOK_LT)) {
+                int save = p->pos;
+                /* lookahead: try parsing type args; if it fails, rewind */
+                TypeSpec **args = NULL; int count = 0;
+                jmp_buf saved; memcpy(&saved, &p->escape, sizeof(jmp_buf));
+                p->suppress_errors++;
+                if (setjmp(p->escape) == 0) {
+                    parse_type_args(p, &args, &count);
+                    memcpy(&p->escape, &saved, sizeof(jmp_buf));
+                    p->suppress_errors--;
+                    if (check(p, TOK_LPAREN)) {
+                        return expr_generic(myon_strdup(t->lexeme), args, count, line);
+                    }
+                    /* Not a constructor call: rewind, treat '<' as comparison. */
+                    for (int i = 0; i < count; i++) typespec_free(args[i]);
+                    free(args);
+                    p->pos = save;
+                } else {
+                    memcpy(&p->escape, &saved, sizeof(jmp_buf));
+                    p->suppress_errors--;
+                    p->pos = save;
+                }
+            }
             return expr_ident(myon_strdup(t->lexeme), line);
+        }
         case TOK_KW_SELF:
             advance(p);
             return expr_ident(myon_strdup("self"), line);
-        /* myon.print / myon.input appear as callable primaries. The lexer
-         * folds them into single tokens; represent them as identifiers whose
-         * name is the full "myon.<x>" so the interpreter can dispatch. */
         case TOK_MYON_PRINT:
             advance(p);
             return expr_ident(myon_strdup("myon.print"), line);
         case TOK_MYON_INPUT:
             advance(p);
             return expr_ident(myon_strdup("myon.input"), line);
+        case TOK_KW_MYON: {
+            /* bare "myon" followed by ".<ident>" — module-qualified access,
+             * e.g. myon.math.sqrt or an aliased module member. Represent as a
+             * dotted identifier so the interpreter can resolve it. */
+            advance(p);
+            char buf[128];
+            size_t len = (size_t)snprintf(buf, sizeof(buf), "myon");
+            while (check(p, TOK_DOT) && peek_type(p, 1) == TOK_IDENT) {
+                advance(p); /* '.' */
+                const Token *seg = advance(p);
+                len += (size_t)snprintf(buf + len, sizeof(buf) - len, ".%s", seg->lexeme);
+            }
+            return expr_ident(myon_strdup(buf), line);
+        }
         case TOK_KW_RANGE:
-            /* range( , ) only appears in for-headers; not a general primary */
             perror_at(p, t, "'range' is only valid in a myon.for header");
             return NULL;
         case TOK_LPAREN: {
@@ -171,13 +321,11 @@ static Expr *parse_primary(Parser *p) {
     }
 }
 
-/* parse an argument list: `expr` or `name=expr` (spec 13 arg). */
 static void parse_arg_list(Parser *p, CallExpr *call) {
     if (check(p, TOK_RPAREN)) return;
     do {
         char *name = NULL;
-        /* keyword argument: identifier '=' expression */
-        if (check(p, TOK_IDENT) && p->toks[p->pos + 1].type == TOK_ASSIGN) {
+        if (check(p, TOK_IDENT) && peek_type(p, 1) == TOK_ASSIGN) {
             name = myon_strdup(peek(p)->lexeme);
             advance(p); /* ident */
             advance(p); /* '=' */
@@ -187,7 +335,6 @@ static void parse_arg_list(Parser *p, CallExpr *call) {
     } while (match(p, TOK_COMMA));
 }
 
-/* postfix: member access, index, call */
 static Expr *parse_postfix(Parser *p) {
     Expr *e = parse_primary(p);
     for (;;) {
@@ -215,7 +362,6 @@ static Expr *parse_postfix(Parser *p) {
 /* Precedence climbing (spec 3.2)                                      */
 /* ------------------------------------------------------------------ */
 
-/* unary = [ "-" ] postfix   (myon.not handled at not_expr level) */
 static Expr *parse_unary(Parser *p) {
     int line = peek(p)->line;
     if (match(p, TOK_MINUS))
@@ -245,7 +391,6 @@ static Expr *parse_additive(Parser *p) {
     return e;
 }
 
-/* comparison = additive [ comp_op additive ]  (non-associative per EBNF) */
 static Expr *parse_comparison(Parser *p) {
     Expr *e = parse_additive(p);
     int line = peek(p)->line;
@@ -264,7 +409,6 @@ static Expr *parse_comparison(Parser *p) {
     return expr_binary(op, e, r, line);
 }
 
-/* not_expr = [ "myon.not" ] comparison */
 static Expr *parse_not(Parser *p) {
     int line = peek(p)->line;
     if (match(p, TOK_MYON_NOT))
@@ -300,12 +444,9 @@ static Expr *parse_expression(Parser *p) {
 /* Statements                                                          */
 /* ------------------------------------------------------------------ */
 
-/* system myon.useversion = int */
 static Stmt *parse_system(Parser *p) {
     int line = peek(p)->line;
     advance(p); /* system */
-    /* expect "myon" "." "useversion" — the lexer emits bare "myon" then '.'
-     * then ident "useversion" because useversion is not a myon keyword. */
     expect(p, TOK_KW_MYON, "expected 'myon' after 'system'");
     expect(p, TOK_DOT, "expected '.' after 'myon'");
     const Token *field = expect(p, TOK_IDENT, "expected 'useversion'");
@@ -318,13 +459,10 @@ static Stmt *parse_system(Parser *p) {
     return s;
 }
 
-/* module module_path [ as identifier ]
- * module_path = ident { "." ident }, where the head may be the "myon" kw. */
 static Stmt *parse_module(Parser *p) {
     int line = peek(p)->line;
     advance(p); /* module */
 
-    /* build dotted path string */
     char buf[256];
     size_t len = 0;
     buf[0] = '\0';
@@ -353,13 +491,11 @@ static Stmt *parse_module(Parser *p) {
     return s;
 }
 
-/* Is the current position the start of an assignment statement?
- * Lookahead: IDENT (":" type)? "=" | IDENT compound_op
- *            IDENT ("," IDENT)+ "="   (multi-target) */
+/* Does the current position start a simple-target assignment?
+ * Handles: IDENT (":" ...)? "=" | IDENT compound_op | IDENT ("," IDENT)+ "=" */
 static int looks_like_assignment(Parser *p) {
     if (!check(p, TOK_IDENT)) return 0;
     int i = p->pos + 1;
-    /* optional ": type" */
     if (p->toks[i].type == TOK_COLON) return 1;
     if (p->toks[i].type == TOK_ASSIGN) return 1;
     switch (p->toks[i].type) {
@@ -367,7 +503,6 @@ static int looks_like_assignment(Parser *p) {
         case TOK_STAR_EQ: case TOK_SLASH_EQ: return 1;
         default: break;
     }
-    /* multi-target: IDENT ("," IDENT)* "=" */
     if (p->toks[i].type == TOK_COMMA) {
         while (p->toks[i].type == TOK_COMMA) {
             if (p->toks[i + 1].type != TOK_IDENT) return 0;
@@ -383,10 +518,9 @@ static Stmt *parse_assignment(Parser *p) {
     const Token *name = expect(p, TOK_IDENT, "expected identifier");
     Stmt *s = stmt_new(STMT_ASSIGN, line);
     s->as.assign.name = myon_strdup(name->lexeme);
-    s->as.assign.annotated = TYPE_UNKNOWN;
+    s->as.assign.annotated = NULL;
     s->as.assign.compound = (OpKind)-1;
 
-    /* multi-target */
     while (match(p, TOK_COMMA)) {
         const Token *extra = expect(p, TOK_IDENT, "expected identifier in assignment target");
         int n = s->as.assign.extra_count + 1;
@@ -402,7 +536,7 @@ static Stmt *parse_assignment(Parser *p) {
     }
 
     if (match(p, TOK_ASSIGN)) {
-        /* plain / typed / multi assignment */
+        /* plain */
     } else if (check(p, TOK_PLUS_EQ) || check(p, TOK_MINUS_EQ) ||
                check(p, TOK_STAR_EQ) || check(p, TOK_SLASH_EQ)) {
         switch (cur(p)) {
@@ -422,16 +556,12 @@ static Stmt *parse_assignment(Parser *p) {
     return s;
 }
 
-/* if_stmt = myon.if expr block { myon.elif expr then block } [ myon.else block ] */
 static Stmt *parse_if(Parser *p) {
     int line = peek(p)->line;
     advance(p); /* myon.if */
     Stmt *s = stmt_new(STMT_IF, line);
     s->as.if_stmt.cond = parse_expression(p);
-    /* Spec 5.1 states `then` is only required on myon.elif, but the spec's
-     * own samples (5.2, section 16) write `myon.if <cond> then { ... }`.
-     * We therefore accept an optional `then` after myon.if for compatibility. */
-    match(p, TOK_KW_THEN);
+    match(p, TOK_KW_THEN);  /* accept optional 'then' (spec samples use it) */
     stmtlist_init(&s->as.if_stmt.then_body);
     parse_block(p, &s->as.if_stmt.then_body);
 
@@ -462,7 +592,7 @@ static Stmt *parse_if(Parser *p) {
 
 static Stmt *parse_while(Parser *p) {
     int line = peek(p)->line;
-    advance(p); /* myon.while */
+    advance(p);
     Stmt *s = stmt_new(STMT_WHILE, line);
     s->as.while_stmt.cond = parse_expression(p);
     stmtlist_init(&s->as.while_stmt.body);
@@ -470,10 +600,9 @@ static Stmt *parse_while(Parser *p) {
     return s;
 }
 
-/* for_stmt = myon.for ident myon.in (range_expr | expression) block */
 static Stmt *parse_for(Parser *p) {
     int line = peek(p)->line;
-    advance(p); /* myon.for */
+    advance(p);
     const Token *var = expect(p, TOK_IDENT, "expected loop variable after myon.for");
     expect(p, TOK_MYON_IN, "expected myon.in in for header");
 
@@ -498,7 +627,134 @@ static Stmt *parse_for(Parser *p) {
     return s;
 }
 
-/* block = "{" statement_list "}" */
+/* type_params = "<" identifier { "," identifier } ">" */
+static void parse_tparams(Parser *p, char ***names_out, int *count_out) {
+    char **names = NULL;
+    int count = 0;
+    expect(p, TOK_LT, "expected '<'");
+    do {
+        const Token *n = expect(p, TOK_IDENT, "expected type parameter name");
+        names = (char **)myon_xrealloc(names, sizeof(char *) * (count + 1));
+        names[count++] = myon_strdup(n->lexeme);
+    } while (match(p, TOK_COMMA));
+    expect(p, TOK_GT, "expected '>' to close type parameters");
+    *names_out = names;
+    *count_out = count;
+}
+
+/* func_decl = [async] myon.func ident [tparams] "(" params ")" ret types block */
+static FuncDecl *parse_func_decl(Parser *p, int is_async) {
+    FuncDecl *fd = (FuncDecl *)myon_xmalloc(sizeof(FuncDecl));
+    memset(fd, 0, sizeof(FuncDecl));
+    fd->is_async = is_async;
+
+    advance(p); /* myon.func */
+    const Token *name = expect(p, TOK_IDENT, "expected function name");
+    fd->name = myon_strdup(name->lexeme);
+
+    if (check(p, TOK_LT))
+        parse_tparams(p, &fd->tparams, &fd->tparam_count);
+
+    expect(p, TOK_LPAREN, "expected '(' after function name");
+    if (!check(p, TOK_RPAREN)) {
+        do {
+            const Token *pn = expect(p, TOK_IDENT, "expected parameter name");
+            expect(p, TOK_COLON, "expected ':' after parameter name (types are required)");
+            TypeSpec *pt = parse_type(p);
+            fd->params = (Param *)myon_xrealloc(fd->params, sizeof(Param) * (fd->param_count + 1));
+            fd->params[fd->param_count].name = myon_strdup(pn->lexeme);
+            fd->params[fd->param_count].type = pt;
+            fd->param_count++;
+        } while (match(p, TOK_COMMA));
+    }
+    expect(p, TOK_RPAREN, "expected ')' after parameters");
+    expect(p, TOK_KW_RET, "expected 'ret' return-type clause");
+    do {
+        TypeSpec *rt = parse_type(p);
+        fd->ret_types = (TypeSpec **)myon_xrealloc(fd->ret_types, sizeof(TypeSpec *) * (fd->ret_count + 1));
+        fd->ret_types[fd->ret_count++] = rt;
+    } while (match(p, TOK_COMMA));
+
+    fd->body = (StmtList *)myon_xmalloc(sizeof(StmtList));
+    stmtlist_init(fd->body);
+    parse_block(p, fd->body);
+    return fd;
+}
+
+static Stmt *parse_func_stmt(Parser *p, int is_async) {
+    int line = peek(p)->line;
+    Stmt *s = stmt_new(STMT_FUNC, line);
+    s->as.func = parse_func_decl(p, is_async);
+    return s;
+}
+
+/* struct_decl = myon.struct ident [tparams] [extends ident] "{" ... "}" */
+static Stmt *parse_struct(Parser *p) {
+    int line = peek(p)->line;
+    advance(p); /* myon.struct */
+    StructDecl *sd = (StructDecl *)myon_xmalloc(sizeof(StructDecl));
+    memset(sd, 0, sizeof(StructDecl));
+
+    const Token *name = expect(p, TOK_IDENT, "expected struct name");
+    sd->name = myon_strdup(name->lexeme);
+
+    if (check(p, TOK_LT))
+        parse_tparams(p, &sd->tparams, &sd->tparam_count);
+
+    if (match(p, TOK_MYON_EXTENDS)) {
+        const Token *parent = expect(p, TOK_IDENT, "expected parent struct name after myon.extends");
+        sd->parent_name = myon_strdup(parent->lexeme);
+    }
+
+    expect(p, TOK_LBRACE, "expected '{' to open struct body");
+    skip_terminators(p);
+    while (!check(p, TOK_RBRACE) && !at_eof(p)) {
+        if (check(p, TOK_MYON_FUNC)) {
+            FuncDecl *m = parse_func_decl(p, 0);
+            sd->methods = (FuncDecl **)myon_xrealloc(sd->methods, sizeof(FuncDecl *) * (sd->method_count + 1));
+            sd->methods[sd->method_count++] = m;
+        } else {
+            const Token *fn = expect(p, TOK_IDENT, "expected field name");
+            expect(p, TOK_COLON, "expected ':' after field name");
+            TypeSpec *ft = parse_type(p);
+            sd->fields = (StructField *)myon_xrealloc(sd->fields, sizeof(StructField) * (sd->field_count + 1));
+            sd->fields[sd->field_count].name = myon_strdup(fn->lexeme);
+            sd->fields[sd->field_count].type = ft;
+            sd->field_count++;
+        }
+        skip_terminators(p);
+    }
+    expect(p, TOK_RBRACE, "expected '}' to close struct body");
+
+    Stmt *s = stmt_new(STMT_STRUCT, line);
+    s->as.struct_decl = sd;
+    return s;
+}
+
+/* return_stmt = "ret" expression { "," expression } */
+static Stmt *parse_return(Parser *p) {
+    int line = peek(p)->line;
+    advance(p); /* ret */
+    Stmt *s = stmt_new(STMT_RETURN, line);
+    s->as.ret.values = NULL;
+    s->as.ret.count = 0;
+    /* An empty ret (bare) is not in the grammar; ret void uses the 'void'
+     * type keyword as an expression sentinel handled by the interpreter. */
+    if (check(p, TOK_KW_VOID)) {
+        advance(p);
+        return s; /* count 0 => void */
+    }
+    if (!check(p, TOK_NEWLINE) && !check(p, TOK_SEMICOLON) &&
+        !check(p, TOK_RBRACE) && !at_eof(p)) {
+        do {
+            Expr *v = parse_expression(p);
+            s->as.ret.values = (Expr **)myon_xrealloc(s->as.ret.values, sizeof(Expr *) * (s->as.ret.count + 1));
+            s->as.ret.values[s->as.ret.count++] = v;
+        } while (match(p, TOK_COMMA));
+    }
+    return s;
+}
+
 static void parse_block(Parser *p, StmtList *out) {
     expect(p, TOK_LBRACE, "expected '{' to open block");
     skip_terminators(p);
@@ -510,6 +766,41 @@ static void parse_block(Parser *p, StmtList *out) {
     expect(p, TOK_RBRACE, "expected '}' to close block");
 }
 
+/* Convert a trailing expression statement into a member/index assignment
+ * when it is followed by '=' (e.g. p.name = ..., xs[0] = ...). */
+static Stmt *parse_expr_or_target_assign(Parser *p) {
+    int line = peek(p)->line;
+    Expr *e = parse_expression(p);
+    if ((e->kind == EXPR_MEMBER || e->kind == EXPR_INDEX) && check(p, TOK_ASSIGN)) {
+        advance(p); /* '=' */
+        Stmt *s = stmt_new(STMT_ASSIGN, line);
+        s->as.assign.target = e;
+        s->as.assign.compound = (OpKind)-1;
+        s->as.assign.value = parse_expression(p);
+        return s;
+    }
+    if ((e->kind == EXPR_MEMBER || e->kind == EXPR_INDEX) &&
+        (check(p, TOK_PLUS_EQ) || check(p, TOK_MINUS_EQ) ||
+         check(p, TOK_STAR_EQ) || check(p, TOK_SLASH_EQ))) {
+        Stmt *s = stmt_new(STMT_ASSIGN, line);
+        s->as.assign.target = e;
+        switch (cur(p)) {
+            case TOK_PLUS_EQ:  s->as.assign.compound = OP_ADD; break;
+            case TOK_MINUS_EQ: s->as.assign.compound = OP_SUB; break;
+            case TOK_STAR_EQ:  s->as.assign.compound = OP_MUL; break;
+            case TOK_SLASH_EQ: s->as.assign.compound = OP_DIV; break;
+            default: break;
+        }
+        s->as.assign.is_compound = 1;
+        advance(p);
+        s->as.assign.value = parse_expression(p);
+        return s;
+    }
+    Stmt *s = stmt_new(STMT_EXPR, line);
+    s->as.expr = e;
+    return s;
+}
+
 static Stmt *parse_statement(Parser *p) {
     switch (cur(p)) {
         case TOK_KW_SYSTEM:      return parse_system(p);
@@ -517,6 +808,14 @@ static Stmt *parse_statement(Parser *p) {
         case TOK_MYON_IF:        return parse_if(p);
         case TOK_MYON_WHILE:     return parse_while(p);
         case TOK_MYON_FOR:       return parse_for(p);
+        case TOK_MYON_FUNC:      return parse_func_stmt(p, 0);
+        case TOK_MYON_STRUCT:    return parse_struct(p);
+        case TOK_KW_RET:         return parse_return(p);
+        case TOK_MYON_ASYNC:
+            advance(p); /* myon.async */
+            if (!check(p, TOK_MYON_FUNC))
+                perror_at(p, peek(p), "expected myon.func after myon.async");
+            return parse_func_stmt(p, 1);
         case TOK_MYON_BREAK: {
             int line = peek(p)->line; advance(p);
             return stmt_new(STMT_BREAK, line);
@@ -542,14 +841,7 @@ static Stmt *parse_statement(Parser *p) {
         default:
             if (looks_like_assignment(p))
                 return parse_assignment(p);
-            /* expression statement (e.g. myon.print(...)) */
-            {
-                int line = peek(p)->line;
-                Expr *e = parse_expression(p);
-                Stmt *s = stmt_new(STMT_EXPR, line);
-                s->as.expr = e;
-                return s;
-            }
+            return parse_expr_or_target_assign(p);
     }
 }
 
@@ -562,6 +854,7 @@ Program *parser_parse(const TokenList *tokens) {
     p.toks = tokens->items;
     p.count = tokens->count;
     p.pos = 0;
+    p.suppress_errors = 0;
 
     Program *volatile prog = (Program *)myon_xmalloc(sizeof(Program));
     stmtlist_init(&prog->stmts);
@@ -575,7 +868,6 @@ Program *parser_parse(const TokenList *tokens) {
     while (!at_eof(&p)) {
         Stmt *s = parse_statement(&p);
         if (s) stmtlist_push(&prog->stmts, s);
-        /* statements must be separated by newline/semicolon or EOF/'}' */
         if (!at_eof(&p) && !check(&p, TOK_NEWLINE) && !check(&p, TOK_SEMICOLON)) {
             perror_at(&p, peek(&p), "expected end of statement");
         }

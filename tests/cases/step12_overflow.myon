@@ -1,0 +1,3 @@
+module myon.stdio
+big = 9223372036854775807
+r = big + 1

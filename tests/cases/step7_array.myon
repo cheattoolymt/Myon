@@ -1,0 +1,10 @@
+module myon.stdio
+xs = myon.array(int)
+xs.push(10)
+xs.push(20)
+xs.push(30)
+myon.print(xs.length())
+myon.print(xs[1])
+xs.pop()
+myon.print(xs.length())
+myon.for v myon.in xs { myon.print(v) }

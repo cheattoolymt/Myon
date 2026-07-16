@@ -14,6 +14,7 @@
 
 CC      ?= cc
 CFLAGS  ?= -std=c11 -Wall -Wextra -Wpedantic -O2
+LDLIBS  ?= -lm
 SRC_DIR  = src
 BUILD    = build
 BIN      = myon
@@ -26,7 +27,7 @@ OBJECTS  = $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(SOURCES))
 all: $(BIN)
 
 $(BIN): $(OBJECTS)
-	$(CC) $(CFLAGS) -o $@ $(OBJECTS)
+	$(CC) $(CFLAGS) -o $@ $(OBJECTS) $(LDLIBS)
 
 $(BUILD)/%.o: $(SRC_DIR)/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@

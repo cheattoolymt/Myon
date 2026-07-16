@@ -1,0 +1,15 @@
+module myon.stdio
+myon.struct Person {
+    name: str
+    age: int
+    myon.func greet() ret void { myon.print("Hi, I am {self.name}") }
+}
+myon.struct Employee myon.extends Person {
+    salary: int
+    myon.func showSalary() ret void { myon.print("{self.name}: {self.salary}") }
+}
+p = Person(name=str("Taro"), age=20)
+p.greet()
+e = Employee(name=str("Hanako"), age=30, salary=5000)
+e.greet()
+e.showSalary()

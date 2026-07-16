@@ -1,0 +1,4 @@
+module myon.stdio
+x = 1
+y: int = 2
+myon.print(x + y)

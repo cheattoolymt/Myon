@@ -32,6 +32,7 @@ typedef struct Binding {
 typedef struct Env {
     Binding    *head;
     struct Env *parent;
+    int         is_block;   /* explicit { } block scope (spec 9.2 shadowing) */
 } Env;
 
 Env  *env_new(Env *parent);
