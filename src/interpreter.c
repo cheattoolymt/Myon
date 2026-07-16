@@ -20,6 +20,7 @@
 #include "common.h"
 #include "lexer.h"
 #include "parser.h"
+#include "diag.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,7 +51,7 @@ typedef struct ModuleEntry {
     struct ModuleEntry *next;
 } ModuleEntry;
 
-typedef struct {
+struct Interp {
     Env         *global;
     StructReg    structs;
     ModuleEntry *modules;
@@ -60,7 +61,11 @@ typedef struct {
     int          ret_count;
     /* generic type-parameter bindings active in the current call */
     Env         *type_env;   /* name -> not used as value; tracked separately */
-} Interp;
+    /* retained parsed programs (REPL keeps ASTs alive across inputs) */
+    Program    **programs;
+    int          program_count;
+};
+typedef struct Interp Interp;
 
 static void runtime_error(Interp *it, int line, const char *fmt, ...) {
     va_list ap;
@@ -69,6 +74,10 @@ static void runtime_error(Interp *it, int line, const char *fmt, ...) {
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
+    /* P5: show the offending source line.  The interpreter only tracks the
+     * line (not the column) for a running expression, so the caret points at
+     * the start of the line as a best-effort locator. */
+    diag_print_snippet(line, 1);
     longjmp(it->on_error, 1);
 }
 
@@ -419,11 +428,124 @@ static double as_number(Interp *it, int line, Value v) {
     return 0;
 }
 
+/* Build a 2-value tuple (value, error) for the Rust/Go-style return
+ * convention (spec 6.2).  Uses the same untyped-array tuple representation as
+ * multi-value `ret`, so multiple-target assignment can unpack it. */
+static Value make_result_pair(Value ok, Value err) {
+    Value tup = value_array(NULL);
+    array_push(&tup, ok);
+    array_push(&tup, err);
+    return tup;
+}
+
+/* ------------------------------------------------------------------ */
+/* Standard library: myon.file.* (Step P4 — file I/O)                  */
+/*                                                                     */
+/* Failures do not raise a Myon runtime_error; instead they are        */
+/* surfaced as an `error(...)` value in the second tuple slot so the   */
+/* caller can inspect it with `myon.if err != myon.nil` (spec 6.2).    */
+/* ------------------------------------------------------------------ */
+
+/* Dispatch a "myon.file.<fn>" call. Returns 1 and sets *out if handled. */
+static int call_file_io(Interp *it, Env *env, const char *name, Expr *call, Value *out) {
+    int line = call->line;
+
+    /* myon.file.read(path) ret str, error */
+    if (strcmp(name, "myon.file.read") == 0) {
+        Value p = eval_arg(it, env, call, 0);
+        if (p.type != TYPE_STR) { value_free(&p); runtime_error(it, line, "myon.file.read expects a str path"); }
+        const char *path = p.as.obj->as.str;
+        if (!path) { value_free(&p); *out = make_result_pair(value_str(myon_strdup("")), value_error(myon_strdup("null path"))); return 1; }
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            char msg[512];
+            snprintf(msg, sizeof(msg), "cannot open '%s' for reading", path);
+            value_free(&p);
+            *out = make_result_pair(value_str(myon_strdup("")), value_error(myon_strdup(msg)));
+            return 1;
+        }
+        size_t cap = 4096, len = 0;
+        char *buf = (char *)myon_xmalloc(cap);
+        int c;
+        while ((c = fgetc(f)) != EOF) {
+            if (len + 1 >= cap) { cap *= 2; buf = (char *)myon_xrealloc(buf, cap); }
+            buf[len++] = (char)c;
+        }
+        buf[len] = '\0';
+        fclose(f);
+        value_free(&p);
+        *out = make_result_pair(value_str(buf), value_nil());
+        return 1;
+    }
+
+    /* myon.file.write(path, content) / myon.file.append(path, content)
+     *   ret bool, error */
+    if (strcmp(name, "myon.file.write") == 0 || strcmp(name, "myon.file.append") == 0) {
+        int append = (strcmp(name, "myon.file.append") == 0);
+        Value p = eval_arg(it, env, call, 0);
+        Value cnt = eval_arg(it, env, call, 1);
+        if (p.type != TYPE_STR || cnt.type != TYPE_STR) {
+            value_free(&p); value_free(&cnt);
+            runtime_error(it, line, "%s expects (str path, str content)", name);
+        }
+        const char *path = p.as.obj->as.str;
+        const char *content = cnt.as.obj->as.str;
+        if (!path) {
+            value_free(&p); value_free(&cnt);
+            *out = make_result_pair(value_bool(0), value_error(myon_strdup("null path")));
+            return 1;
+        }
+        FILE *f = fopen(path, append ? "ab" : "wb");
+        if (!f) {
+            char msg[512];
+            snprintf(msg, sizeof(msg), "cannot open '%s' for %s", path, append ? "appending" : "writing");
+            value_free(&p); value_free(&cnt);
+            *out = make_result_pair(value_bool(0), value_error(myon_strdup(msg)));
+            return 1;
+        }
+        size_t n = strlen(content);
+        size_t w = fwrite(content, 1, n, f);
+        int close_err = fclose(f);
+        if (w != n || close_err != 0) {
+            char msg[512];
+            snprintf(msg, sizeof(msg), "write to '%s' failed", path);
+            value_free(&p); value_free(&cnt);
+            *out = make_result_pair(value_bool(0), value_error(myon_strdup(msg)));
+            return 1;
+        }
+        value_free(&p); value_free(&cnt);
+        *out = make_result_pair(value_bool(1), value_nil());
+        return 1;
+    }
+
+    /* myon.file.exists(path) ret bool */
+    if (strcmp(name, "myon.file.exists") == 0) {
+        Value p = eval_arg(it, env, call, 0);
+        if (p.type != TYPE_STR) { value_free(&p); runtime_error(it, line, "myon.file.exists expects a str path"); }
+        const char *path = p.as.obj->as.str;
+        int exists = 0;
+        if (path) {
+            FILE *f = fopen(path, "rb");
+            if (f) { exists = 1; fclose(f); }
+        }
+        value_free(&p);
+        *out = value_bool(exists);
+        return 1;
+    }
+
+    return 0;
+}
+
 /* dispatch a "myon.math.<fn>" or "myon.string.<fn>" call.
  * Returns 1 and sets *out if handled. */
 static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value *out) {
     int argc = call->as.call.arg_count;
     int line = call->line;
+
+    /* ---- myon.file (file I/O, P4) ---- */
+    if (strncmp(name, "myon.file.", 10) == 0) {
+        if (call_file_io(it, env, name, call, out)) return 1;
+    }
 
     /* ---- myon.math ---- */
     if (strcmp(name, "myon.math.sqrt") == 0) {
@@ -1467,48 +1589,90 @@ static void prescan(Interp *it, Env *env, Program *prog) {
 /* Entry point                                                         */
 /* ------------------------------------------------------------------ */
 
+Interp *interp_create(void) {
+    Interp *it = (Interp *)myon_xmalloc(sizeof(Interp));
+    memset(it, 0, sizeof(*it));
+    it->global = env_new(NULL);
+    return it;
+}
+
+void interp_free(Interp *it) {
+    if (!it) return;
+    env_free(it->global);
+    free(it->structs.items);
+    ModuleEntry *m = it->modules;
+    while (m) { ModuleEntry *n = m->next; free(m->path); free(m->alias); free(m); m = n; }
+    /* free retained program ASTs (structs/functions may reference their nodes,
+     * so this only happens once the interpreter itself is torn down). */
+    for (int i = 0; i < it->program_count; i++)
+        program_free(it->programs[i]);
+    free(it->programs);
+    free(it);
+}
+
+/*
+ * Execute a program's top-level statements on `it`'s global scope.  Assumes a
+ * setjmp barrier for it->on_error has already been installed by the caller.
+ * Returns 0 normally, 1 on the break/continue-outside-loop error.
+ */
+static int run_toplevel(Interp *it, Program *program) {
+    /* load modules first (so external decls hoist) */
+    for (int i = 0; i < program->stmts.count; i++)
+        if (program->stmts.items[i]->kind == STMT_MODULE)
+            handle_module_decl(it, program->stmts.items[i]);
+
+    /* hoist struct/function declarations */
+    prescan(it, it->global, program);
+
+    for (int i = 0; i < program->stmts.count; i++) {
+        Stmt *s = program->stmts.items[i];
+        if (s->kind == STMT_MODULE) continue; /* already handled */
+        Flow f = exec_stmt(it, it->global, s);
+        if (f == FLOW_BREAK || f == FLOW_CONTINUE) {
+            fprintf(stderr, "myon: runtime error: break/continue outside of a loop\n");
+            return 1;
+        }
+        if (f == FLOW_RETURN) {
+            /* top-level ret: ignore returned values */
+            for (int k = 0; k < it->ret_count; k++) value_free(&it->ret_values[k]);
+            free(it->ret_values);
+            it->ret_values = NULL; it->ret_count = 0;
+        }
+    }
+    return 0;
+}
+
+int interp_run(Interp *it, Program *program) {
+    /* retain the AST for the interpreter's lifetime */
+    it->programs = (Program **)myon_xrealloc(
+        it->programs, sizeof(Program *) * (it->program_count + 1));
+    it->programs[it->program_count++] = program;
+
+    if (setjmp(it->on_error)) {
+        /* a runtime error aborted this program; interpreter stays alive */
+        return 1;
+    }
+    return run_toplevel(it, program);
+}
+
 int interpret(Program *program) {
     Interp it;
     memset(&it, 0, sizeof(it));
     it.global = env_new(NULL);
 
+    int rc = 0;
     if (setjmp(it.on_error)) {
-        env_free(it.global);
-        free(it.structs.items);
-        ModuleEntry *m = it.modules;
-        while (m) { ModuleEntry *n = m->next; free(m->path); free(m->alias); free(m); m = n; }
-        return 1;
-    }
-
-    /* load modules first (so external decls hoist) */
-    for (int i = 0; i < program->stmts.count; i++)
-        if (program->stmts.items[i]->kind == STMT_MODULE)
-            handle_module_decl(&it, program->stmts.items[i]);
-
-    /* hoist struct/function declarations */
-    prescan(&it, it.global, program);
-
-    for (int i = 0; i < program->stmts.count; i++) {
-        Stmt *s = program->stmts.items[i];
-        if (s->kind == STMT_MODULE) continue; /* already handled */
-        Flow f = exec_stmt(&it, it.global, s);
-        if (f == FLOW_BREAK || f == FLOW_CONTINUE) {
-            fprintf(stderr, "myon: runtime error: break/continue outside of a loop\n");
-            env_free(it.global);
-            free(it.structs.items);
-            return 1;
-        }
-        if (f == FLOW_RETURN) {
-            /* top-level ret: ignore returned values */
-            for (int k = 0; k < it.ret_count; k++) value_free(&it.ret_values[k]);
-            free(it.ret_values);
-            it.ret_values = NULL; it.ret_count = 0;
-        }
+        rc = 1;
+    } else {
+        rc = run_toplevel(&it, program);
     }
 
     env_free(it.global);
     free(it.structs.items);
     ModuleEntry *m = it.modules;
     while (m) { ModuleEntry *n = m->next; free(m->path); free(m->alias); free(m); m = n; }
-    return 0;
+    /* NOTE: for the one-shot path the caller (main.c) owns and frees `program`;
+     * we retain no programs here so it->programs stays NULL. */
+    free(it.programs);
+    return rc;
 }

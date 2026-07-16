@@ -1,0 +1,27 @@
+module myon.stdio
+myon.struct Hero {
+    name: str
+    hp: int
+}
+hero = Hero(
+    name = str("勇者"),
+    hp = 80
+)
+myon.print("{hero.name} {hero.hp}")
+myon.func add(a: int, b: int) ret int {
+    ret a + b
+}
+r = add(add(
+  1,
+  2
+), 3)
+myon.print(r)
+xs = myon.array(int)
+xs.push(
+    100
+)
+myon.print(
+    xs[
+        0
+    ]
+)

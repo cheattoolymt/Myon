@@ -16,6 +16,7 @@
 
 #include "parser.h"
 #include "common.h"
+#include "diag.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -59,14 +60,23 @@ static void perror_at(Parser *p, const Token *t, const char *msg) {
      * instantiation "Foo<int>(...)" from the comparison "i < 10") a failed
      * parse is expected and recovered from, so don't leak its diagnostic. */
     if (p->suppress_errors == 0) {
-        fprintf(stderr, "myon: syntax error at line %d: %s (got '%s')\n",
-                t->line, msg, token_type_name(t->type));
+        /* P5: include the column and a friendly name for the offending token,
+         * then print the source line with a caret under the failure column. */
+        fprintf(stderr,
+                "myon: syntax error at line %d, column %d: %s (got %s)\n",
+                t->line, t->col, msg, diag_token_friendly(t->type));
+        diag_print_snippet(t->line, t->col);
     }
     longjmp(p->escape, 1);
 }
 
 static const Token *expect(Parser *p, TokenType t, const char *msg) {
     if (check(p, t)) return advance(p);
+    /* P5: if the caller passed a bare/short message, still surface the
+     * expected token in a human-friendly form.  The msg already carries the
+     * caller's intent (e.g. "expected ')' to close arguments"), so we keep it
+     * verbatim; perror_at appends the friendly "got X" tail. */
+    (void)t;
     perror_at(p, peek(p), msg);
     return NULL;
 }
