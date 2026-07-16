@@ -3,12 +3,9 @@
 半分ネタ、半分実用(？)
 
 **Myon** は型に厳密なプログラミング言語です。言語仕様は [`docs/spec.md`](docs/spec.md) を参照してください。
-本リポジトリには C 言語による処理系（インタプリタ）を、
-[`myon_implementation_steps.md`](myon_implementation_steps.md) のステップに沿って段階的に実装しています。
 
 ## 実装状況
 
-[`myon_implementation_steps.md`](myon_implementation_steps.md) の全ステップ（Step 0〜18）を実装済みです。
 `make test` により、下表の各ステップに対応する回帰テスト（計 24 ケース）がすべてパスします。
 
 | ステップ | 内容 | 状態 |
