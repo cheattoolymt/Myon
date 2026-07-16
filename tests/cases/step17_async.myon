@@ -1,0 +1,4 @@
+module myon.stdio
+myon.async myon.func fetchData() ret str { ret str("done") }
+r = myon.await fetchData()
+myon.print(r)

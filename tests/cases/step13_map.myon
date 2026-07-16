@@ -1,0 +1,11 @@
+module myon.stdio
+m = myon.map(str, int)
+m.set(str("age"), 20)
+myon.print(m.get(str("age")))
+myon.print(m.has(str("age")))
+m.delete(str("age"))
+myon.print(m.has(str("age")))
+h = 0x1F
+o = 0o17
+myon.print(h)
+myon.print(o)

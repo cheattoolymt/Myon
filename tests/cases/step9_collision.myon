@@ -1,0 +1,3 @@
+module myon.stdio
+myon.struct A { x: int }
+myon.struct B myon.extends A { x: int }

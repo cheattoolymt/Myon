@@ -1,0 +1,6 @@
+module myon.stdio
+myon.struct Box<T> { value: T }
+bi = Box<int>(value=5)
+bs = Box<str>(value=str("hi"))
+myon.print(bi.value)
+myon.print(bs.value)

@@ -1,0 +1,8 @@
+module myon.stdio
+module myon.math
+module myon.string
+myon.print(myon.math.sqrt(16.0))
+myon.print(myon.math.max(3, 7))
+myon.print(myon.math.abs(-4))
+myon.print(myon.string.upper(str("hi")))
+myon.print(myon.string.length(str("hello")))

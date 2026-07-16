@@ -1,0 +1,3 @@
+module myon.stdio
+xs = myon.array(int)
+xs.push(str("no"))

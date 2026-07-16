@@ -1,0 +1,5 @@
+module myon.stdio
+threshold = 10
+isOver = myon.lambda(x: int) ret bool { ret x > threshold }
+myon.print(isOver(15))
+myon.print(isOver(5))

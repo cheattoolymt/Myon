@@ -21,9 +21,9 @@
  * Abstract syntax tree node definitions.
  * Reference: spec.md section 13 (EBNF).
  *
- * The node set is laid out to mirror the grammar so future steps
- * (functions, structs, arrays, etc.) can be filled in incrementally.
- * Steps 0-5 exercise expressions, assignments, print, and control flow.
+ * Covers Steps 0-18: expressions, control flow, functions (6), arrays (7),
+ * scope/expose (8), structs (9), string interpolation (10), modules (11),
+ * maps (13), generics (15), async/await (17).
  */
 
 #include "types.h"
@@ -43,7 +43,7 @@ typedef enum {
     EXPR_CHAR_CTOR,    /* char(expr)  */
     EXPR_INT_CTOR,     /* int(expr)   */
     EXPR_ERROR_CTOR,   /* error(expr) */
-    EXPR_STRING,       /* raw "..." string literal (interpolation is Step 10) */
+    EXPR_STRING,       /* raw "..." string literal (interpolation at eval, Step 10) */
     EXPR_NIL,          /* myon.nil    */
     EXPR_IDENT,
     EXPR_BINARY,
@@ -51,7 +51,12 @@ typedef enum {
     EXPR_LOGICAL,      /* myon.and / myon.or */
     EXPR_CALL,
     EXPR_INDEX,        /* a[b]        */
-    EXPR_MEMBER        /* a.b         */
+    EXPR_MEMBER,       /* a.b         */
+    EXPR_ARRAY_CTOR,   /* myon.array(T)          (Step 7) */
+    EXPR_MAP_CTOR,     /* myon.map(K, V)         (Step 13) */
+    EXPR_LAMBDA,       /* myon.lambda(...) ret T { } (Step 6) */
+    EXPR_AWAIT,        /* myon.await expr        (Step 17) */
+    EXPR_GENERIC       /* Ident<T,...>  generic instantiation (Step 15) */
 } ExprKind;
 
 typedef enum {
@@ -66,7 +71,26 @@ typedef struct {
     Expr **args;      /* positional arg expressions */
     char **arg_names; /* parallel to args; NULL entry => positional */
     int    arg_count;
+    /* explicit generic type args, e.g. first<int>(...) — may be NULL */
+    TypeSpec **type_args;
+    int        type_arg_count;
 } CallExpr;
+
+/* ---- function / lambda declaration (shared by Step 6 & 9 methods) ---- */
+typedef struct { char *name; TypeSpec *type; } Param;
+
+typedef struct FuncDecl {
+    char      *name;          /* NULL for a lambda */
+    int        is_async;      /* myon.async (Step 17) */
+    Param     *params;
+    int        param_count;
+    TypeSpec **ret_types;     /* one or more (multiple return, 6.2) */
+    int        ret_count;
+    /* generic type parameters, e.g. <T, U> (Step 15) */
+    char     **tparams;
+    int        tparam_count;
+    struct StmtList *body;    /* pointer so Value/Obj can hold it opaquely */
+} FuncDecl;
 
 struct Expr {
     ExprKind kind;
@@ -77,12 +101,16 @@ struct Expr {
         int         bool_val;    /* EXPR_BOOL_LIT */
         char       *str_val;     /* EXPR_STRING (raw body)  */
         char       *ident;       /* EXPR_IDENT */
-        Expr       *operand;     /* EXPR_*_CTOR / EXPR_UNARY */
+        Expr       *operand;     /* EXPR_*_CTOR / EXPR_AWAIT */
         struct { OpKind op; Expr *left; Expr *right; } binary; /* BINARY/LOGICAL */
         struct { OpKind op; Expr *operand; } unary;
         CallExpr    call;
         struct { Expr *target; Expr *index; } index;
         struct { Expr *target; char *name; } member;
+        TypeSpec   *array_elem;  /* EXPR_ARRAY_CTOR */
+        struct { TypeSpec *key; TypeSpec *val; } map_types; /* EXPR_MAP_CTOR */
+        FuncDecl   *lambda;      /* EXPR_LAMBDA */
+        struct { char *name; TypeSpec **args; int arg_count; } generic; /* EXPR_GENERIC */
     } as;
 };
 
@@ -101,15 +129,19 @@ typedef enum {
     STMT_BREAK,
     STMT_CONTINUE,
     STMT_BLOCK,
-    STMT_EXPOSE
+    STMT_EXPOSE,
+    STMT_FUNC,        /* function declaration (Step 6) */
+    STMT_STRUCT,      /* struct declaration (Step 9) */
+    STMT_RETURN       /* ret expr, expr, ... (Step 6) */
 } StmtKind;
 
 /* A block is a dynamic list of statements. */
-typedef struct {
+struct StmtList {
     Stmt **items;
     int    count;
     int    capacity;
-} StmtList;
+};
+typedef struct StmtList StmtList;
 
 /* One "myon.elif expr then { ... }" arm. */
 typedef struct {
@@ -117,26 +149,43 @@ typedef struct {
     StmtList  body;
 } ElifArm;
 
+/* ---- struct declaration (Step 9) ---- */
+typedef struct StructField { char *name; TypeSpec *type; } StructField;
+
+typedef struct StructDecl {
+    char        *name;
+    char        *parent_name;   /* myon.extends (may be NULL) */
+    struct StructDecl *parent;  /* resolved at runtime (not owned) */
+    StructField *fields;
+    int          field_count;
+    FuncDecl   **methods;
+    int          method_count;
+    char       **tparams;       /* generic type params (Step 15) */
+    int          tparam_count;
+} StructDecl;
+
 struct Stmt {
     StmtKind kind;
     int      line;
     union {
-        struct { int version; } system_decl;              /* STMT_SYSTEM */
-        struct { char *path; char *alias; } module_decl;   /* STMT_MODULE; alias may be NULL */
+        struct { int version; } system_decl;               /* STMT_SYSTEM */
+        struct { char *path; char *alias; } module_decl;    /* STMT_MODULE */
 
         struct {
             char    *name;
-            Type     annotated;   /* declared type, or TYPE_UNKNOWN if omitted */
-            int      has_type;     /* 1 if an explicit ": type" was given */
+            TypeSpec *annotated;   /* declared type (owned) or NULL */
+            int      has_type;
             OpKind   compound;     /* OP_ADD/SUB/MUL/DIV for +=,... else -1 */
             int      is_compound;
             Expr    *value;
-            /* multi-target assignment: `a, b = f()` (Step 6 groundwork) */
-            char   **extra_names;  /* additional LHS names beyond `name` */
+            /* multi-target assignment: `a, b = f()` */
+            char   **extra_names;
             int      extra_count;
-        } assign;                                          /* STMT_ASSIGN */
+            /* assignment to a member/index target (a.b = v, a[i] = v) */
+            Expr    *target;       /* non-NULL => LHS is target, `name` unused */
+        } assign;                                           /* STMT_ASSIGN */
 
-        Expr *expr;                                        /* STMT_EXPR */
+        Expr *expr;                                         /* STMT_EXPR */
 
         struct {
             Expr     *cond;
@@ -145,21 +194,26 @@ struct Stmt {
             int       elif_count;
             int       has_else;
             StmtList  else_body;
-        } if_stmt;                                         /* STMT_IF */
+        } if_stmt;                                          /* STMT_IF */
 
-        struct { Expr *cond; StmtList body; } while_stmt;  /* STMT_WHILE */
+        struct { Expr *cond; StmtList body; } while_stmt;   /* STMT_WHILE */
 
         struct {
             char    *var;
             int      is_range;
-            Expr    *range_start;  /* if is_range */
-            Expr    *range_end;    /* if is_range */
-            Expr    *iterable;     /* if !is_range */
+            Expr    *range_start;
+            Expr    *range_end;
+            Expr    *iterable;
             StmtList body;
-        } for_stmt;                                        /* STMT_FOR */
+        } for_stmt;                                         /* STMT_FOR */
 
-        StmtList block;                                    /* STMT_BLOCK */
-        char    *expose_name;                              /* STMT_EXPOSE */
+        StmtList block;                                     /* STMT_BLOCK */
+        char    *expose_name;                               /* STMT_EXPOSE */
+
+        FuncDecl  *func;                                    /* STMT_FUNC */
+        StructDecl *struct_decl;                            /* STMT_STRUCT */
+
+        struct { Expr **values; int count; } ret;           /* STMT_RETURN */
     } as;
 };
 
@@ -168,7 +222,7 @@ typedef struct {
     StmtList stmts;
 } Program;
 
-/* ---- constructors ---- */
+/* ---- expression constructors ---- */
 Expr *expr_int(long long v, int line);
 Expr *expr_float(double v, int line);
 Expr *expr_bool(int v, int line);
@@ -182,15 +236,24 @@ Expr *expr_unary(OpKind op, Expr *operand, int line);
 Expr *expr_call(Expr *callee, int line);
 Expr *expr_index(Expr *target, Expr *index, int line);
 Expr *expr_member(Expr *target, char *name, int line);
+Expr *expr_array_ctor(TypeSpec *elem, int line);
+Expr *expr_map_ctor(TypeSpec *key, TypeSpec *val, int line);
+Expr *expr_lambda(FuncDecl *decl, int line);
+Expr *expr_await(Expr *operand, int line);
+Expr *expr_generic(char *name, TypeSpec **args, int arg_count, int line);
 void  call_add_arg(CallExpr *call, char *name, Expr *arg);
 
+/* ---- statement constructors / lists ---- */
 Stmt *stmt_new(StmtKind kind, int line);
 void  stmtlist_init(StmtList *list);
 void  stmtlist_push(StmtList *list, Stmt *s);
 void  stmtlist_free(StmtList *list);
 
+/* ---- destructors ---- */
 void  expr_free(Expr *e);
 void  stmt_free(Stmt *s);
 void  program_free(Program *p);
+void  funcdecl_free(FuncDecl *f);
+void  structdecl_free(StructDecl *s);
 
 #endif /* MYON_AST_H */

@@ -1,0 +1,5 @@
+module myon.stdio
+x = 1
+{
+    x = 2
+}

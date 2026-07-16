@@ -1,0 +1,4 @@
+module myon.stdio
+name = str("Aya")
+age = 19
+myon.print("Hello, {name}! Next year you'll be {age + 1}.")

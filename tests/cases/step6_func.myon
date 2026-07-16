@@ -1,0 +1,11 @@
+module myon.stdio
+myon.func add(a: int, b: int) ret int { ret a + b }
+myon.func divide(a: int, b: int) ret int, error {
+    myon.if b == 0 then { ret 0, error("div by zero") }
+    ret a / b, myon.nil
+}
+myon.print(add(3, 4))
+q, e = divide(10, 2)
+myon.if e != myon.nil { myon.print("err") } myon.else { myon.print(q) }
+q2, e2 = divide(1, 0)
+myon.if e2 != myon.nil { myon.print(e2) } myon.else { myon.print(q2) }
