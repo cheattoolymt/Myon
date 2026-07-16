@@ -1,0 +1,4 @@
+system myon.useversion=1
+module myon.stdio
+x = str("人間")
+myon.print("Hello Worlddd! ", x + "!")

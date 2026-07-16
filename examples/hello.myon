@@ -1,0 +1,7 @@
+# Step 3 sample: variable assignment and myon.print
+# (spec.md section 3, section 10)
+system myon.useversion=1
+module myon.stdio
+
+x = str("人間")
+myon.print("Hello Worlddd! ", x + "!")

@@ -1,0 +1,9 @@
+a = 5
+b = 3
+myon.if a > b {
+    myon.print("a")
+} myon.elif b > a then {
+    myon.print("b")
+} myon.else {
+    myon.print("none")
+}

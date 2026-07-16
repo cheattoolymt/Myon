@@ -1,0 +1,6 @@
+x = 5
+myon.if x > 0 myon.and x < 10 {
+    myon.print("in range")
+}
+flag = myon.not false
+myon.print(flag)
