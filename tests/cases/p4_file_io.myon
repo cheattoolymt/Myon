@@ -1,0 +1,12 @@
+module myon.stdio
+path = "/tmp/myon_p4_testcase.txt"
+ok, werr = myon.file.write(path, "line1")
+myon.if werr != myon.nil then { myon.print("WRITE_FAIL") } myon.else { myon.print("wrote") }
+aok, aerr = myon.file.append(path, "-line2")
+myon.if aerr != myon.nil then { myon.print("APPEND_FAIL") } myon.else { myon.print("appended") }
+content, rerr = myon.file.read(path)
+myon.if rerr != myon.nil then { myon.print("READ_FAIL") } myon.else { myon.print(content) }
+myon.print(myon.file.exists(path))
+myon.print(myon.file.exists("/tmp/myon_p4_absent_xyz.txt"))
+bad, berr = myon.file.read("/tmp/myon_p4_absent_xyz.txt")
+myon.if berr != myon.nil then { myon.print("error captured") } myon.else { myon.print("NO_ERROR") }

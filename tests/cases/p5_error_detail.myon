@@ -1,0 +1,5 @@
+# P5: this file intentionally contains a syntax error so that the detailed
+# error reporter (line + column + source caret) is exercised.
+# The parser should report a column and print the offending line with a '^'.
+module myon.stdio
+myon.print(1, 2 3)

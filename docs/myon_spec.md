@@ -63,6 +63,22 @@
 x = 1; y = 2; myon.print(x + y)
 ```
 
+- ただし `()` / `[]` の内部にある改行は文の区切りとみなさない。
+  これにより、関数呼び出しの引数リストや配列アクセスなどを複数行に
+  分けて書ける（字句解析器が `(`・`[` の深さを数え、深度が0より大きい
+  間は改行を読み飛ばす）。
+
+```myon
+hero = Hero(
+    name = str("勇者"),
+    hp = 80
+)
+```
+
+- 一方、ブロック本体を囲む `{}` の内部では改行は引き続き文の区切りとして
+  機能する（複数の文を並べるために改行が必要なため、`{}` は上記の深さ計算に
+  含めない）。
+
 ### 1.5 予約語一覧
 
 ```
@@ -136,6 +152,17 @@ flag = true
 **論理演算子（プレフィックススタイル）**
 ```
 myon.and  myon.or  myon.not
+```
+
+`myon.not` は前置専用の単項演算子である（EBNF: `not_expr = [ "myon.not" ], comparison ;`）。
+必ずオペランドの前に置くこと。後置で書くと構文エラーになる。
+
+```myon
+// 正しい書き方（前置）
+myon.if myon.not flag then { ... }
+
+// 誤り（後置は構文エラーになる）
+// myon.if flag myon.not then { ... }
 ```
 
 **複合代入演算子**
@@ -242,6 +269,31 @@ myon.if err != myon.nil then {
 }
 ```
 
+### 6.2.1 診断メッセージの形式（構文/実行時エラー）
+
+構文エラー・実行時エラーは、gcc / Rust コンパイラ風の詳細な形式で報告する。
+
+- **行番号と列番号**の両方を表示する（字句解析器が保持する `col` を活用）。
+- **該当行のソースコード抜粋**と、エラー位置を指す `^` マーカーを表示する。
+- 構文エラーでは、期待していたトークン種別を人間が読みやすい表現に変換して出す
+  （例：`TOK_RPAREN` ではなく `')'`、`TOK_EOF` ではなく `end of file`）。
+
+```
+myon: syntax error at line 5, column 17: expected ')' to close call (got an integer literal)
+     5 | myon.print(1, 2 3)
+       |                 ^
+```
+
+実行時エラー（型不一致・範囲外アクセス・ゼロ除算・整数オーバーフロー等）でも、
+発生行のソース抜粋を表示する。実行時は列情報を保持していないため、キャレットは
+行頭を指すベストエフォートの位置となる。
+
+```
+myon: runtime error at line 4: division by zero
+     4 | myon.print(a / b)
+       | ^
+```
+
 ### 6.3 ラムダ（無名関数）
 
 `myon.lambda` で定義。外側スコープの変数を捕捉できる（通常のクロージャ）。
@@ -339,10 +391,51 @@ x = 1
 
 ## 10. 入出力
 
+### 10.1 標準入出力
+
 ```myon
 name = myon.input("お名前は？")   // str型で受け取る
 myon.print("Hello Worlddd! ", x + "!")
 ```
+
+### 10.2 ファイルI/O
+
+`module myon.stdio` を宣言すると、以下のファイル操作関数が利用できる。
+読み書きに失敗した場合（ファイル不在・権限不足など）は、`runtime_error` で
+プロセスを終了させるのではなく、6.2節のエラー処理方式（Rust/Go 風、`error(...)`）
+に従って第2戻り値として `error` 値を返す。呼び出し側は `myon.if err != myon.nil`
+でこれを捕捉できる。
+
+| 関数 | シグネチャ | 説明 |
+|------|-----------|------|
+| `myon.file.read`   | `myon.file.read(path: str) ret str, error`            | ファイル全体を `str` として読み込む |
+| `myon.file.write`  | `myon.file.write(path: str, content: str) ret bool, error`  | 上書き書き込み（成功時 `true`） |
+| `myon.file.append` | `myon.file.append(path: str, content: str) ret bool, error` | 末尾に追記（成功時 `true`） |
+| `myon.file.exists` | `myon.file.exists(path: str) ret bool`                | 存在確認（エラーは返さない） |
+
+```myon
+module myon.stdio
+
+path = "/tmp/greeting.txt"
+ok, werr = myon.file.write(path, "line1")
+myon.if werr != myon.nil then { myon.print("書き込み失敗") }
+
+aok, aerr = myon.file.append(path, "-line2")
+
+content, rerr = myon.file.read(path)
+myon.if rerr != myon.nil then {
+    myon.print("読み込み失敗")
+} myon.else {
+    myon.print(content)          // line1-line2
+}
+
+myon.print(myon.file.exists(path))                       // true
+myon.print(myon.file.exists("/tmp/does_not_exist.txt"))  // false
+```
+
+- 成功時の第2戻り値（`error`）は `myon.nil` になる。
+- `NULL` パス等、明らかに未定義動作になりうる入力はガードする。
+  パストラバーサル対策など高度な安全性は本フェーズの対象外。
 
 ---
 
@@ -369,6 +462,28 @@ module myon.stdio
 x = str("人間")
 myon.print("Hello Worlddd! ", x + "!")
 ```
+
+### 12.1 対話モード（REPL）
+
+`myon` を引数なしで起動すると対話式実行（REPL）モードに入る。
+
+- プロンプトは `myon> `。入力が構文として未完（`()`/`[]`/`{}` が閉じていない等）の
+  場合は継続プロンプト `...> ` を表示し、閉じるまで入力を受け付ける
+- REPL 内で定義した変数・関数・構造体はセッション終了まで保持される
+  （インタプリタと環境を使い回す）
+- 実行時エラーが起きても REPL は終了せず、次の入力を受け付け続ける
+  （エラーはそのステートメントの中断のみ）
+- `exit` / `quit` または EOF（Ctrl+D）で終了する
+
+```
+$ myon
+myon> x = 1
+myon> myon.print(x)
+1
+myon> exit
+```
+
+ファイル実行モード（`myon file.myon`）は従来通り。
 
 ---
 
@@ -518,11 +633,16 @@ has = m.has(str("age"))
 
 `myon.stdio` に加え、以下を最初から用意する。
 
-- `myon.stdio`：`myon.print`, `myon.input`
+- `myon.stdio`：`myon.print`, `myon.input`, および以下のファイルI/O関数
+  - `myon.file.read(path: str) ret str, error`
+  - `myon.file.write(path: str, content: str) ret bool, error`
+  - `myon.file.append(path: str, content: str) ret bool, error`
+  - `myon.file.exists(path: str) ret bool`
 - `myon.math`：数学関数（詳細は別途API仕様で定義）
 - `myon.string`：文字列操作関数（詳細は別途API仕様で定義）
 
-具体的な関数シグネチャは今後のAPI仕様書で別途定める。
+ファイルI/Oの詳細な挙動（エラー伝播など）は10.2節を参照。
+その他の具体的な関数シグネチャは今後のAPI仕様書で別途定める。
 
 ### 14.5 モジュール循環参照
 
@@ -562,6 +682,12 @@ myon.func first<T>(xs: myon.array(T)) ret T {
 }
 ```
 
+**型制約は導入しない（確定事項）。** `T: Comparable` のような境界指定は
+サポートせず、ジェネリクスは型パラメータへの型の代入のみを行う。任意の型を
+渡すことができる。現状のジェネリクス実装が「型の代入のみ」というシンプルな
+モデルであることを踏まえ、言語の複雑度を抑える実用性重視の判断としてこの方針を
+確定する。将来、型制約がないと困る具体的な利用シーンが現れた段階で改めて検討する。
+
 ### 14.9 並行処理・非同期処理
 
 `myon.async` / `myon.await` を導入する。
@@ -574,18 +700,28 @@ myon.async myon.func fetchData() ret str {
 result = myon.await fetchData()
 ```
 
-具体的な実行モデル（スレッドベースか、イベントループベースか等）は
-処理系実装フェーズで別途検討する。
+**実行モデルは疑似非同期（シングルスレッド）に確定する。**
+`myon.async` / `myon.await` はシングルスレッド上での糖衣構文であり、
+`myon.async` 関数は呼び出された時点で即座に同期実行される。複数の
+`myon.async` 関数が物理的に並行して進行することはない。
+
+この判断は実用性重視の方針による。本格的な並行実行（スレッド／イベントループ）
+を導入すると、値の参照カウント（`refcount`）をスレッドセーフにする必要があり、
+処理系本体アーキテクチャの大規模な見直しが必要になる。まずは軽量な疑似非同期を
+正式仕様として確定し、本格的な並行実行が必要になった場合は別途大規模な設計
+フェーズとして切り出す。
 
 ---
 
 ## 15. Open Questions（残存する未決定事項）
 
-- `myon.async`/`myon.await` の具体的な実行モデル（スレッド/イベントループ）
-- ジェネリクスにおける型制約（`T: Comparable` のような境界指定）の要否
 - `myon.map` のキー型に許される範囲（str/int以外の任意型を許すか）
 - 標準ライブラリ `myon.math`/`myon.string` の具体的な関数シグネチャ一覧
 - 型推論をリテラル以外の式（関数呼び出し結果等）にも広げるか
+
+> 以下は Phase 2 で確定済みのため本リストから除外した。
+> - `myon.async`/`myon.await` の実行モデル → 疑似非同期に確定（14.9節）
+> - ジェネリクスの型制約 → 導入しないことに確定（14.8節）
 
 ---
 

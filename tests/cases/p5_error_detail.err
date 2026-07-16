@@ -1,0 +1,3 @@
+# Expect a non-zero exit: the malformed call above is a syntax error.
+# The exact message text is intentionally not pinned (per Phase 2 P5),
+# only that the interpreter reports an error and exits non-zero.

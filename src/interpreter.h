@@ -28,4 +28,29 @@
  */
 int interpret(Program *program);
 
+/*
+ * Persistent interpreter handle used by the interactive REPL (spec 12).
+ *
+ * Unlike interpret(), which builds and tears down a fresh interpreter for a
+ * single program, these functions let a caller keep one interpreter alive
+ * across many independently-parsed programs so that variables, functions and
+ * structs defined earlier stay visible later.
+ */
+typedef struct Interp Interp;
+
+/* Create an interpreter with an empty global environment. */
+Interp *interp_create(void);
+
+/* Free an interpreter and all state it owns. */
+void interp_free(Interp *it);
+
+/*
+ * Run one parsed program against a persistent interpreter.  A setjmp barrier
+ * is installed inside, so a runtime error aborts only the current program and
+ * leaves the interpreter usable for the next call (returns non-zero).  On
+ * success returns 0.  The program's AST is retained by the interpreter for
+ * its lifetime (function/struct values may reference its nodes).
+ */
+int interp_run(Interp *it, Program *program);
+
 #endif /* MYON_INTERPRETER_H */

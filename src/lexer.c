@@ -32,6 +32,12 @@ typedef struct {
     int         col;
     TokenList  *out;
     bool        error;
+    /* Nesting depth of "()" and "[]".  While this is > 0 the lexer treats
+     * newlines as insignificant whitespace so that argument lists / array
+     * literals can span multiple lines (spec 1.4).  Curly braces "{}" are
+     * intentionally NOT counted here: block bodies use newlines as statement
+     * separators, so a newline inside "{}" must remain significant. */
+    int         paren_depth;
 } Lexer;
 
 static void tl_push(TokenList *list, Token tok) {
@@ -317,12 +323,16 @@ static void scan_operator(Lexer *lx) {
         case ',': emit(lx, TOK_COMMA, myon_strdup(","), line, col); return;
         case ':': emit(lx, TOK_COLON, myon_strdup(":"), line, col); return;
         case ';': emit(lx, TOK_SEMICOLON, myon_strdup(";"), line, col); return;
-        case '(': emit(lx, TOK_LPAREN, myon_strdup("("), line, col); return;
-        case ')': emit(lx, TOK_RPAREN, myon_strdup(")"), line, col); return;
+        /* "(" and "[" increase paren depth so that newlines inside argument
+         * lists / array literals are not treated as statement separators
+         * (spec 1.4).  "{" does NOT: block bodies rely on newlines. */
+        case '(': lx->paren_depth++; emit(lx, TOK_LPAREN, myon_strdup("("), line, col); return;
+        case '[': lx->paren_depth++; emit(lx, TOK_LBRACKET, myon_strdup("["), line, col); return;
         case '{': emit(lx, TOK_LBRACE, myon_strdup("{"), line, col); return;
+        /* matching closers decrease depth (clamped at 0 for malformed input). */
+        case ')': if (lx->paren_depth > 0) lx->paren_depth--; emit(lx, TOK_RPAREN, myon_strdup(")"), line, col); return;
+        case ']': if (lx->paren_depth > 0) lx->paren_depth--; emit(lx, TOK_RBRACKET, myon_strdup("]"), line, col); return;
         case '}': emit(lx, TOK_RBRACE, myon_strdup("}"), line, col); return;
-        case '[': emit(lx, TOK_LBRACKET, myon_strdup("["), line, col); return;
-        case ']': emit(lx, TOK_RBRACKET, myon_strdup("]"), line, col); return;
         default: {
             char buf[64];
             snprintf(buf, sizeof(buf), "unexpected character '%c' (0x%02x)", c, (unsigned char)c);
@@ -344,6 +354,7 @@ int lexer_tokenize(const char *source, TokenList *out) {
     lx.col = 1;
     lx.out = out;
     lx.error = false;
+    lx.paren_depth = 0;
 
     out->items = NULL;
     out->count = 0;
@@ -355,10 +366,14 @@ int lexer_tokenize(const char *source, TokenList *out) {
         /* whitespace (except newline) */
         if (c == ' ' || c == '\t' || c == '\r') { advance(&lx); continue; }
 
-        /* newline => statement separator token (collapse consecutive) */
+        /* newline => statement separator token (collapse consecutive).
+         * Inside "()" or "[]" (paren_depth > 0) newlines are insignificant
+         * and simply skipped, so argument lists and array literals may span
+         * multiple lines (spec 1.4). */
         if (c == '\n') {
             int line = lx.line, col = lx.col;
             advance(&lx);
+            if (lx.paren_depth > 0) continue; /* line continuation inside ()/[] */
             /* avoid emitting leading/duplicate newlines */
             if (out->count > 0 && out->items[out->count - 1].type != TOK_NEWLINE)
                 emit(&lx, TOK_NEWLINE, myon_strdup("\\n"), line, col);
