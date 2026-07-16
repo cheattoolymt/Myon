@@ -1,0 +1,28 @@
+# Step 5 sample: if/elif/else, while, for (spec.md section 5)
+system myon.useversion=1
+module myon.stdio
+
+a = 5
+b = 3
+
+myon.if a > b {
+    myon.print("aがbよりデカい")
+} myon.elif b > a then {
+    myon.print("bがaよりデカい")
+} myon.else {
+    myon.print("しらね")
+}
+
+# while + break
+i = 0
+myon.while i < 10 {
+    myon.print(i)
+    i = i + 1
+    myon.if i == 5 then { myon.break }
+}
+
+# for over a range + continue
+myon.for k myon.in range(0, 10) {
+    myon.if k == 3 then { myon.continue }
+    myon.print(k)
+}

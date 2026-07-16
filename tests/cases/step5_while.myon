@@ -1,0 +1,6 @@
+i = 0
+myon.while i < 10 {
+    myon.print(i)
+    i = i + 1
+    myon.if i == 5 then { myon.break }
+}

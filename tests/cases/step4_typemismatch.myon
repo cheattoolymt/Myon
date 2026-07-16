@@ -1,0 +1,3 @@
+c = char("a")
+n = 1
+myon.print(c + n)

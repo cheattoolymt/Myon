@@ -1,0 +1,585 @@
+/*
+ * Copyright 2026 nyan<(nyan4)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "parser.h"
+#include "common.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <setjmp.h>
+
+/* ------------------------------------------------------------------ */
+/* Parser state                                                        */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    const Token *toks;
+    int          count;
+    int          pos;
+    jmp_buf      escape;   /* longjmp target on syntax error */
+} Parser;
+
+static Expr *parse_expression(Parser *p);
+static void  parse_block(Parser *p, StmtList *out);
+static Stmt *parse_statement(Parser *p);
+
+/* ---- token access ---- */
+
+static const Token *peek(Parser *p)  { return &p->toks[p->pos]; }
+static const Token *prev(Parser *p)  { return &p->toks[p->pos - 1]; }
+static TokenType    cur(Parser *p)   { return p->toks[p->pos].type; }
+static int          at_eof(Parser *p){ return cur(p) == TOK_EOF; }
+
+static int check(Parser *p, TokenType t) { return cur(p) == t; }
+
+static const Token *advance(Parser *p) {
+    if (!at_eof(p)) p->pos++;
+    return prev(p);
+}
+
+static int match(Parser *p, TokenType t) {
+    if (check(p, t)) { advance(p); return 1; }
+    return 0;
+}
+
+static void perror_at(Parser *p, const Token *t, const char *msg) {
+    fprintf(stderr, "myon: syntax error at line %d: %s (got '%s')\n",
+            t->line, msg, token_type_name(t->type));
+    longjmp(p->escape, 1);
+}
+
+static const Token *expect(Parser *p, TokenType t, const char *msg) {
+    if (check(p, t)) return advance(p);
+    perror_at(p, peek(p), msg);
+    return NULL; /* unreachable */
+}
+
+/* skip newline / semicolon statement separators */
+static void skip_terminators(Parser *p) {
+    while (check(p, TOK_NEWLINE) || check(p, TOK_SEMICOLON)) advance(p);
+}
+
+/* ------------------------------------------------------------------ */
+/* Type parsing (subset needed for Steps 0-5)                          */
+/* ------------------------------------------------------------------ */
+
+static Type token_to_type(TokenType t) {
+    switch (t) {
+        case TOK_KW_INT:   return TYPE_INT;
+        case TOK_KW_FLOAT: return TYPE_FLOAT;
+        case TOK_KW_STR:   return TYPE_STR;
+        case TOK_KW_CHAR:  return TYPE_CHAR;
+        case TOK_KW_BOOL:  return TYPE_BOOL;
+        case TOK_KW_VOID:  return TYPE_VOID;
+        case TOK_KW_ERROR: return TYPE_ERROR;
+        default:           return TYPE_UNKNOWN;
+    }
+}
+
+static Type parse_type(Parser *p) {
+    Type t = token_to_type(cur(p));
+    if (t == TYPE_UNKNOWN)
+        perror_at(p, peek(p), "expected a type name");
+    advance(p);
+    return t;
+}
+
+/* ------------------------------------------------------------------ */
+/* Primary / postfix expressions                                       */
+/* ------------------------------------------------------------------ */
+
+/* one of str()/char()/int()/error() value constructors */
+static Expr *parse_ctor(Parser *p, ExprKind kind) {
+    int line = peek(p)->line;
+    advance(p); /* the keyword */
+    expect(p, TOK_LPAREN, "expected '(' after type constructor");
+    Expr *inner = parse_expression(p);
+    expect(p, TOK_RPAREN, "expected ')' to close constructor");
+    return expr_ctor(kind, inner, line);
+}
+
+static Expr *parse_primary(Parser *p) {
+    const Token *t = peek(p);
+    int line = t->line;
+
+    switch (t->type) {
+        case TOK_INT: {
+            advance(p);
+            /* strtoll handles 0x; parse 0o octal manually */
+            long long v;
+            if (t->lexeme[0] == '0' && (t->lexeme[1] == 'o' || t->lexeme[1] == 'O'))
+                v = strtoll(t->lexeme + 2, NULL, 8);
+            else
+                v = strtoll(t->lexeme, NULL, 0);
+            return expr_int(v, line);
+        }
+        case TOK_FLOAT:
+            advance(p);
+            return expr_float(strtod(t->lexeme, NULL), line);
+        case TOK_KW_TRUE:  advance(p); return expr_bool(1, line);
+        case TOK_KW_FALSE: advance(p); return expr_bool(0, line);
+        case TOK_STRING:
+            advance(p);
+            return expr_string(myon_strdup(t->lexeme), line);
+        case TOK_MYON_NIL: advance(p); return expr_nil(line);
+        case TOK_KW_STR:   return parse_ctor(p, EXPR_STR_CTOR);
+        case TOK_KW_CHAR:  return parse_ctor(p, EXPR_CHAR_CTOR);
+        case TOK_KW_INT:   return parse_ctor(p, EXPR_INT_CTOR);
+        case TOK_KW_ERROR: return parse_ctor(p, EXPR_ERROR_CTOR);
+        case TOK_IDENT:
+            advance(p);
+            return expr_ident(myon_strdup(t->lexeme), line);
+        case TOK_KW_SELF:
+            advance(p);
+            return expr_ident(myon_strdup("self"), line);
+        /* myon.print / myon.input appear as callable primaries. The lexer
+         * folds them into single tokens; represent them as identifiers whose
+         * name is the full "myon.<x>" so the interpreter can dispatch. */
+        case TOK_MYON_PRINT:
+            advance(p);
+            return expr_ident(myon_strdup("myon.print"), line);
+        case TOK_MYON_INPUT:
+            advance(p);
+            return expr_ident(myon_strdup("myon.input"), line);
+        case TOK_KW_RANGE:
+            /* range( , ) only appears in for-headers; not a general primary */
+            perror_at(p, t, "'range' is only valid in a myon.for header");
+            return NULL;
+        case TOK_LPAREN: {
+            advance(p);
+            Expr *e = parse_expression(p);
+            expect(p, TOK_RPAREN, "expected ')'");
+            return e;
+        }
+        default:
+            perror_at(p, t, "expected an expression");
+            return NULL;
+    }
+}
+
+/* parse an argument list: `expr` or `name=expr` (spec 13 arg). */
+static void parse_arg_list(Parser *p, CallExpr *call) {
+    if (check(p, TOK_RPAREN)) return;
+    do {
+        char *name = NULL;
+        /* keyword argument: identifier '=' expression */
+        if (check(p, TOK_IDENT) && p->toks[p->pos + 1].type == TOK_ASSIGN) {
+            name = myon_strdup(peek(p)->lexeme);
+            advance(p); /* ident */
+            advance(p); /* '=' */
+        }
+        Expr *arg = parse_expression(p);
+        call_add_arg(call, name, arg);
+    } while (match(p, TOK_COMMA));
+}
+
+/* postfix: member access, index, call */
+static Expr *parse_postfix(Parser *p) {
+    Expr *e = parse_primary(p);
+    for (;;) {
+        int line = peek(p)->line;
+        if (match(p, TOK_DOT)) {
+            const Token *name = expect(p, TOK_IDENT, "expected member name after '.'");
+            e = expr_member(e, myon_strdup(name->lexeme), line);
+        } else if (match(p, TOK_LBRACKET)) {
+            Expr *idx = parse_expression(p);
+            expect(p, TOK_RBRACKET, "expected ']'");
+            e = expr_index(e, idx, line);
+        } else if (match(p, TOK_LPAREN)) {
+            Expr *call = expr_call(e, line);
+            parse_arg_list(p, &call->as.call);
+            expect(p, TOK_RPAREN, "expected ')' to close call");
+            e = call;
+        } else {
+            break;
+        }
+    }
+    return e;
+}
+
+/* ------------------------------------------------------------------ */
+/* Precedence climbing (spec 3.2)                                      */
+/* ------------------------------------------------------------------ */
+
+/* unary = [ "-" ] postfix   (myon.not handled at not_expr level) */
+static Expr *parse_unary(Parser *p) {
+    int line = peek(p)->line;
+    if (match(p, TOK_MINUS))
+        return expr_unary(OP_NEG, parse_unary(p), line);
+    return parse_postfix(p);
+}
+
+static Expr *parse_multiplicative(Parser *p) {
+    Expr *e = parse_unary(p);
+    for (;;) {
+        int line = peek(p)->line;
+        if (match(p, TOK_STAR))       e = expr_binary(OP_MUL, e, parse_unary(p), line);
+        else if (match(p, TOK_SLASH)) e = expr_binary(OP_DIV, e, parse_unary(p), line);
+        else break;
+    }
+    return e;
+}
+
+static Expr *parse_additive(Parser *p) {
+    Expr *e = parse_multiplicative(p);
+    for (;;) {
+        int line = peek(p)->line;
+        if (match(p, TOK_PLUS))       e = expr_binary(OP_ADD, e, parse_multiplicative(p), line);
+        else if (match(p, TOK_MINUS)) e = expr_binary(OP_SUB, e, parse_multiplicative(p), line);
+        else break;
+    }
+    return e;
+}
+
+/* comparison = additive [ comp_op additive ]  (non-associative per EBNF) */
+static Expr *parse_comparison(Parser *p) {
+    Expr *e = parse_additive(p);
+    int line = peek(p)->line;
+    OpKind op;
+    switch (cur(p)) {
+        case TOK_EQ:  op = OP_EQ;  break;
+        case TOK_NEQ: op = OP_NEQ; break;
+        case TOK_LT:  op = OP_LT;  break;
+        case TOK_GT:  op = OP_GT;  break;
+        case TOK_LE:  op = OP_LE;  break;
+        case TOK_GE:  op = OP_GE;  break;
+        default: return e;
+    }
+    advance(p);
+    Expr *r = parse_additive(p);
+    return expr_binary(op, e, r, line);
+}
+
+/* not_expr = [ "myon.not" ] comparison */
+static Expr *parse_not(Parser *p) {
+    int line = peek(p)->line;
+    if (match(p, TOK_MYON_NOT))
+        return expr_unary(OP_NOT, parse_not(p), line);
+    return parse_comparison(p);
+}
+
+static Expr *parse_and(Parser *p) {
+    Expr *e = parse_not(p);
+    while (check(p, TOK_MYON_AND)) {
+        int line = peek(p)->line;
+        advance(p);
+        e = expr_logical(OP_AND, e, parse_not(p), line);
+    }
+    return e;
+}
+
+static Expr *parse_or(Parser *p) {
+    Expr *e = parse_and(p);
+    while (check(p, TOK_MYON_OR)) {
+        int line = peek(p)->line;
+        advance(p);
+        e = expr_logical(OP_OR, e, parse_and(p), line);
+    }
+    return e;
+}
+
+static Expr *parse_expression(Parser *p) {
+    return parse_or(p);
+}
+
+/* ------------------------------------------------------------------ */
+/* Statements                                                          */
+/* ------------------------------------------------------------------ */
+
+/* system myon.useversion = int */
+static Stmt *parse_system(Parser *p) {
+    int line = peek(p)->line;
+    advance(p); /* system */
+    /* expect "myon" "." "useversion" — the lexer emits bare "myon" then '.'
+     * then ident "useversion" because useversion is not a myon keyword. */
+    expect(p, TOK_KW_MYON, "expected 'myon' after 'system'");
+    expect(p, TOK_DOT, "expected '.' after 'myon'");
+    const Token *field = expect(p, TOK_IDENT, "expected 'useversion'");
+    if (strcmp(field->lexeme, "useversion") != 0)
+        perror_at(p, field, "expected 'useversion'");
+    expect(p, TOK_ASSIGN, "expected '=' in system declaration");
+    const Token *v = expect(p, TOK_INT, "expected integer version");
+    Stmt *s = stmt_new(STMT_SYSTEM, line);
+    s->as.system_decl.version = (int)strtol(v->lexeme, NULL, 0);
+    return s;
+}
+
+/* module module_path [ as identifier ]
+ * module_path = ident { "." ident }, where the head may be the "myon" kw. */
+static Stmt *parse_module(Parser *p) {
+    int line = peek(p)->line;
+    advance(p); /* module */
+
+    /* build dotted path string */
+    char buf[256];
+    size_t len = 0;
+    buf[0] = '\0';
+
+    const Token *head = peek(p);
+    if (head->type == TOK_KW_MYON || head->type == TOK_IDENT) {
+        len += (size_t)snprintf(buf + len, sizeof(buf) - len, "%s", head->lexeme);
+        advance(p);
+    } else {
+        perror_at(p, head, "expected module path");
+    }
+    while (match(p, TOK_DOT)) {
+        const Token *seg = expect(p, TOK_IDENT, "expected identifier in module path");
+        len += (size_t)snprintf(buf + len, sizeof(buf) - len, ".%s", seg->lexeme);
+    }
+
+    char *alias = NULL;
+    if (match(p, TOK_KW_AS)) {
+        const Token *a = expect(p, TOK_IDENT, "expected alias identifier after 'as'");
+        alias = myon_strdup(a->lexeme);
+    }
+
+    Stmt *s = stmt_new(STMT_MODULE, line);
+    s->as.module_decl.path = myon_strdup(buf);
+    s->as.module_decl.alias = alias;
+    return s;
+}
+
+/* Is the current position the start of an assignment statement?
+ * Lookahead: IDENT (":" type)? "=" | IDENT compound_op
+ *            IDENT ("," IDENT)+ "="   (multi-target) */
+static int looks_like_assignment(Parser *p) {
+    if (!check(p, TOK_IDENT)) return 0;
+    int i = p->pos + 1;
+    /* optional ": type" */
+    if (p->toks[i].type == TOK_COLON) return 1;
+    if (p->toks[i].type == TOK_ASSIGN) return 1;
+    switch (p->toks[i].type) {
+        case TOK_PLUS_EQ: case TOK_MINUS_EQ:
+        case TOK_STAR_EQ: case TOK_SLASH_EQ: return 1;
+        default: break;
+    }
+    /* multi-target: IDENT ("," IDENT)* "=" */
+    if (p->toks[i].type == TOK_COMMA) {
+        while (p->toks[i].type == TOK_COMMA) {
+            if (p->toks[i + 1].type != TOK_IDENT) return 0;
+            i += 2;
+        }
+        return p->toks[i].type == TOK_ASSIGN;
+    }
+    return 0;
+}
+
+static Stmt *parse_assignment(Parser *p) {
+    int line = peek(p)->line;
+    const Token *name = expect(p, TOK_IDENT, "expected identifier");
+    Stmt *s = stmt_new(STMT_ASSIGN, line);
+    s->as.assign.name = myon_strdup(name->lexeme);
+    s->as.assign.annotated = TYPE_UNKNOWN;
+    s->as.assign.compound = (OpKind)-1;
+
+    /* multi-target */
+    while (match(p, TOK_COMMA)) {
+        const Token *extra = expect(p, TOK_IDENT, "expected identifier in assignment target");
+        int n = s->as.assign.extra_count + 1;
+        s->as.assign.extra_names = (char **)myon_xrealloc(
+            s->as.assign.extra_names, sizeof(char *) * n);
+        s->as.assign.extra_names[s->as.assign.extra_count] = myon_strdup(extra->lexeme);
+        s->as.assign.extra_count = n;
+    }
+
+    if (match(p, TOK_COLON)) {
+        s->as.assign.annotated = parse_type(p);
+        s->as.assign.has_type = 1;
+    }
+
+    if (match(p, TOK_ASSIGN)) {
+        /* plain / typed / multi assignment */
+    } else if (check(p, TOK_PLUS_EQ) || check(p, TOK_MINUS_EQ) ||
+               check(p, TOK_STAR_EQ) || check(p, TOK_SLASH_EQ)) {
+        switch (cur(p)) {
+            case TOK_PLUS_EQ:  s->as.assign.compound = OP_ADD; break;
+            case TOK_MINUS_EQ: s->as.assign.compound = OP_SUB; break;
+            case TOK_STAR_EQ:  s->as.assign.compound = OP_MUL; break;
+            case TOK_SLASH_EQ: s->as.assign.compound = OP_DIV; break;
+            default: break;
+        }
+        s->as.assign.is_compound = 1;
+        advance(p);
+    } else {
+        perror_at(p, peek(p), "expected '=' or compound assignment operator");
+    }
+
+    s->as.assign.value = parse_expression(p);
+    return s;
+}
+
+/* if_stmt = myon.if expr block { myon.elif expr then block } [ myon.else block ] */
+static Stmt *parse_if(Parser *p) {
+    int line = peek(p)->line;
+    advance(p); /* myon.if */
+    Stmt *s = stmt_new(STMT_IF, line);
+    s->as.if_stmt.cond = parse_expression(p);
+    /* Spec 5.1 states `then` is only required on myon.elif, but the spec's
+     * own samples (5.2, section 16) write `myon.if <cond> then { ... }`.
+     * We therefore accept an optional `then` after myon.if for compatibility. */
+    match(p, TOK_KW_THEN);
+    stmtlist_init(&s->as.if_stmt.then_body);
+    parse_block(p, &s->as.if_stmt.then_body);
+
+    s->as.if_stmt.elifs = NULL;
+    s->as.if_stmt.elif_count = 0;
+
+    while (check(p, TOK_MYON_ELIF)) {
+        advance(p);
+        int n = s->as.if_stmt.elif_count + 1;
+        s->as.if_stmt.elifs = (ElifArm *)myon_xrealloc(
+            s->as.if_stmt.elifs, sizeof(ElifArm) * n);
+        ElifArm *arm = &s->as.if_stmt.elifs[s->as.if_stmt.elif_count];
+        arm->cond = parse_expression(p);
+        expect(p, TOK_KW_THEN, "expected 'then' after myon.elif condition");
+        stmtlist_init(&arm->body);
+        parse_block(p, &arm->body);
+        s->as.if_stmt.elif_count = n;
+    }
+
+    if (check(p, TOK_MYON_ELSE)) {
+        advance(p);
+        s->as.if_stmt.has_else = 1;
+        stmtlist_init(&s->as.if_stmt.else_body);
+        parse_block(p, &s->as.if_stmt.else_body);
+    }
+    return s;
+}
+
+static Stmt *parse_while(Parser *p) {
+    int line = peek(p)->line;
+    advance(p); /* myon.while */
+    Stmt *s = stmt_new(STMT_WHILE, line);
+    s->as.while_stmt.cond = parse_expression(p);
+    stmtlist_init(&s->as.while_stmt.body);
+    parse_block(p, &s->as.while_stmt.body);
+    return s;
+}
+
+/* for_stmt = myon.for ident myon.in (range_expr | expression) block */
+static Stmt *parse_for(Parser *p) {
+    int line = peek(p)->line;
+    advance(p); /* myon.for */
+    const Token *var = expect(p, TOK_IDENT, "expected loop variable after myon.for");
+    expect(p, TOK_MYON_IN, "expected myon.in in for header");
+
+    Stmt *s = stmt_new(STMT_FOR, line);
+    s->as.for_stmt.var = myon_strdup(var->lexeme);
+
+    if (check(p, TOK_KW_RANGE)) {
+        advance(p);
+        expect(p, TOK_LPAREN, "expected '(' after range");
+        s->as.for_stmt.is_range = 1;
+        s->as.for_stmt.range_start = parse_expression(p);
+        expect(p, TOK_COMMA, "expected ',' in range(...)");
+        s->as.for_stmt.range_end = parse_expression(p);
+        expect(p, TOK_RPAREN, "expected ')' to close range(...)");
+    } else {
+        s->as.for_stmt.is_range = 0;
+        s->as.for_stmt.iterable = parse_expression(p);
+    }
+
+    stmtlist_init(&s->as.for_stmt.body);
+    parse_block(p, &s->as.for_stmt.body);
+    return s;
+}
+
+/* block = "{" statement_list "}" */
+static void parse_block(Parser *p, StmtList *out) {
+    expect(p, TOK_LBRACE, "expected '{' to open block");
+    skip_terminators(p);
+    while (!check(p, TOK_RBRACE) && !at_eof(p)) {
+        Stmt *s = parse_statement(p);
+        if (s) stmtlist_push(out, s);
+        skip_terminators(p);
+    }
+    expect(p, TOK_RBRACE, "expected '}' to close block");
+}
+
+static Stmt *parse_statement(Parser *p) {
+    switch (cur(p)) {
+        case TOK_KW_SYSTEM:      return parse_system(p);
+        case TOK_KW_MODULE:      return parse_module(p);
+        case TOK_MYON_IF:        return parse_if(p);
+        case TOK_MYON_WHILE:     return parse_while(p);
+        case TOK_MYON_FOR:       return parse_for(p);
+        case TOK_MYON_BREAK: {
+            int line = peek(p)->line; advance(p);
+            return stmt_new(STMT_BREAK, line);
+        }
+        case TOK_MYON_CONTINUE: {
+            int line = peek(p)->line; advance(p);
+            return stmt_new(STMT_CONTINUE, line);
+        }
+        case TOK_MYON_EXPOSE: {
+            int line = peek(p)->line; advance(p);
+            const Token *n = expect(p, TOK_IDENT, "expected identifier after myon.expose");
+            Stmt *s = stmt_new(STMT_EXPOSE, line);
+            s->as.expose_name = myon_strdup(n->lexeme);
+            return s;
+        }
+        case TOK_LBRACE: {
+            int line = peek(p)->line;
+            Stmt *s = stmt_new(STMT_BLOCK, line);
+            stmtlist_init(&s->as.block);
+            parse_block(p, &s->as.block);
+            return s;
+        }
+        default:
+            if (looks_like_assignment(p))
+                return parse_assignment(p);
+            /* expression statement (e.g. myon.print(...)) */
+            {
+                int line = peek(p)->line;
+                Expr *e = parse_expression(p);
+                Stmt *s = stmt_new(STMT_EXPR, line);
+                s->as.expr = e;
+                return s;
+            }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Entry point                                                         */
+/* ------------------------------------------------------------------ */
+
+Program *parser_parse(const TokenList *tokens) {
+    Parser p;
+    p.toks = tokens->items;
+    p.count = tokens->count;
+    p.pos = 0;
+
+    Program *volatile prog = (Program *)myon_xmalloc(sizeof(Program));
+    stmtlist_init(&prog->stmts);
+
+    if (setjmp(p.escape)) {
+        program_free(prog);
+        return NULL;
+    }
+
+    skip_terminators(&p);
+    while (!at_eof(&p)) {
+        Stmt *s = parse_statement(&p);
+        if (s) stmtlist_push(&prog->stmts, s);
+        /* statements must be separated by newline/semicolon or EOF/'}' */
+        if (!at_eof(&p) && !check(&p, TOK_NEWLINE) && !check(&p, TOK_SEMICOLON)) {
+            perror_at(&p, peek(&p), "expected end of statement");
+        }
+        skip_terminators(&p);
+    }
+    return prog;
+}

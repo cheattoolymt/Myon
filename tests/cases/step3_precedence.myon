@@ -1,0 +1,4 @@
+myon.print(2 + 3 * 4)
+myon.print((2 + 3) * 4)
+myon.print(10 - 2 - 3)
+myon.print(-5 + 2)
