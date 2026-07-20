@@ -1,0 +1,14 @@
+# Phase4 Step5: myon.time.now() / now_ms() sanity.
+# Absolute timestamps change every run, so only the deterministic invariants
+# (both are positive int64 values) are printed. sleep_ms timing is verified
+# manually per the instructions, not in this regression test.
+module myon.stdio
+module myon.time
+
+myon.print(myon.time.now() > 0)      # true
+myon.print(myon.time.now_ms() > 0)   # true
+
+# now_ms() is in milliseconds, so it must be at least ~1000x the seconds value.
+s = myon.time.now()
+ms = myon.time.now_ms()
+myon.print(ms > s)                    # true

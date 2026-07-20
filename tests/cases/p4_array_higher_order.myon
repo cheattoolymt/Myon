@@ -1,0 +1,24 @@
+# Phase4 Step3: myon.array map / filter / reduce (lambda-friendly).
+module myon.stdio
+module myon.math
+
+xs = myon.array(int)
+xs.push(1)
+xs.push(2)
+xs.push(3)
+
+# map: double each element -> [2, 4, 6]
+doubled = xs.map(myon.lambda(x: int) ret int { ret x * 2 })
+myon.print(doubled)
+
+# filter: keep even elements only -> [2]
+evens = xs.filter(myon.lambda(x: int) ret bool { r, e = myon.math.mod(x, 2)
+    ret r == 0 })
+myon.print(evens)
+
+# reduce: sum with init 0 -> 6
+sum = xs.reduce(myon.lambda(acc: int, x: int) ret int { ret acc + x }, 0)
+myon.print(sum)
+
+# original array is left unchanged by map/filter
+myon.print(xs)

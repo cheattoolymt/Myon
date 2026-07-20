@@ -1,0 +1,28 @@
+# Phase4 Step2: myon.map keys / values / length.
+# Map iteration order is not guaranteed, so keys()/values() are sorted
+# before comparison to keep the expected output deterministic.
+module myon.stdio
+
+m = myon.map(str, int)
+m.set(str("a"), 1)
+m.set(str("b"), 2)
+m.set(str("c"), 3)
+
+# length()
+myon.print(m.length())         # 3
+
+# keys(): sort for a deterministic dump
+ks = m.keys()
+ks.sort()
+myon.print(ks)                 # [a, b, c]
+
+# values(): contains-based, order-independent checks
+vs = m.values()
+myon.print(vs.contains(1) myon.and vs.contains(2) myon.and vs.contains(3))  # true
+
+# length() stays correct across set / delete
+m.set(str("d"), 4)
+myon.print(m.length())         # 4
+m.delete(str("a"))
+m.delete(str("b"))
+myon.print(m.length())         # 2
