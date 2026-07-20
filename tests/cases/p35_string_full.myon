@@ -1,0 +1,47 @@
+# Phase3.5 Step4: exercise the full myon.string extension set.
+module myon.stdio
+module myon.string
+
+# substring (character-based)
+sub, se = myon.string.substring(str("こんにちは"), 1, 3)
+myon.print(sub)
+
+# split / join round-trip
+parts = myon.string.split(str("a,b,c"), str(","))
+myon.print(parts)
+myon.print(myon.string.join(parts, str(",")))
+
+# split with empty separator: one element per character
+myon.print(myon.string.split(str("xyz"), str("")))
+
+# trim
+myon.print(myon.string.trim(str("  hi  ")))
+
+# replace
+myon.print(myon.string.replace(str("aaa"), str("a"), str("bb")))
+
+# index_of (character-based; -1 when absent)
+myon.print(myon.string.index_of(str("こんにちは"), str("にち")))
+myon.print(myon.string.index_of(str("hello"), str("zz")))
+
+# starts_with / ends_with
+myon.print(myon.string.starts_with(str("hello"), str("he")))
+myon.print(myon.string.ends_with(str("hello"), str("lo")))
+
+# repeat
+r1, re1 = myon.string.repeat(str("ab"), 3)
+myon.print(r1)
+r2, re2 = myon.string.repeat(str("x"), -1)
+myon.if re2 != myon.nil then { myon.print(str("repeat_neg_err")) } myon.else { myon.print(str("repeat_neg_ok")) }
+
+# to_int / to_float
+i1, ie1 = myon.string.to_int(str("123"))
+myon.print(i1)
+i2, ie2 = myon.string.to_int(str("abc"))
+myon.if ie2 != myon.nil then { myon.print(str("to_int_err")) } myon.else { myon.print(str("to_int_ok")) }
+f1, fe1 = myon.string.to_float(str("3.5"))
+myon.print(f1)
+
+# from_int / from_float
+myon.print(myon.string.from_int(42))
+myon.print(myon.string.from_float(2.5))

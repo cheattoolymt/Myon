@@ -1,0 +1,14 @@
+# Phase3.5 Step1: myon.math.max/min/floor/ceil must keep int64 precision.
+# double has only a 52-bit mantissa, so values above 2^53 cannot round-trip
+# through a double; the int-only paths compare/return them exactly.
+module myon.stdio
+module myon.math
+
+myon.print(myon.math.max(9223372036854775807, 1))
+myon.print(myon.math.min(9223372036854775807, 9223372036854775806))
+myon.print(myon.math.max(9007199254740993, 9007199254740992))
+myon.print(myon.math.floor(9223372036854775807))
+myon.print(myon.math.ceil(-9223372036854775807))
+myon.print(myon.math.floor(3.7))
+myon.print(myon.math.ceil(3.2))
+myon.print(myon.math.abs(-4))

@@ -1,0 +1,12 @@
+# Phase3.5 Step2: length counts code points; byte_length counts bytes.
+module myon.stdio
+module myon.string
+
+myon.print(myon.string.length(str("hello")))
+myon.print(myon.string.byte_length(str("hello")))
+myon.print(myon.string.length(str("あいう")))
+myon.print(myon.string.byte_length(str("あいう")))
+myon.print(myon.string.length(str("こんにちは")))
+myon.print(myon.string.byte_length(str("こんにちは")))
+myon.print(myon.string.length(str("aあb")))
+myon.print(myon.string.byte_length(str("aあb")))
