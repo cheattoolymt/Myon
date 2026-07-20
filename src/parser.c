@@ -227,6 +227,24 @@ static Expr *parse_lambda(Parser *p) {
     return expr_lambda(fd, line);
 }
 
+/* True when a token can serve as a trailing segment in a dotted
+ * "myon.<...>" name.  Besides plain identifiers, a handful of stdlib members
+ * reuse type-name keywords as function names (myon.random.int / .float), so
+ * those keyword tokens are accepted here as well. */
+static int seg_is_name(TokenType t) {
+    switch (t) {
+        case TOK_IDENT:
+        case TOK_KW_INT:
+        case TOK_KW_FLOAT:
+        case TOK_KW_STR:
+        case TOK_KW_CHAR:
+        case TOK_KW_BOOL:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 static Expr *parse_primary(Parser *p) {
     const Token *t = peek(p);
     int line = t->line;
@@ -309,7 +327,11 @@ static Expr *parse_primary(Parser *p) {
             advance(p);
             char buf[128];
             size_t len = (size_t)snprintf(buf, sizeof(buf), "myon");
-            while (check(p, TOK_DOT) && peek_type(p, 1) == TOK_IDENT) {
+            /* A dotted segment is normally an identifier, but some stdlib
+             * members reuse type-name keywords as function names
+             * (e.g. myon.random.int / myon.random.float).  Accept those
+             * keyword tokens as trailing segments too, using their lexeme. */
+            while (check(p, TOK_DOT) && seg_is_name(peek_type(p, 1))) {
                 advance(p); /* '.' */
                 const Token *seg = advance(p);
                 len += (size_t)snprintf(buf + len, sizeof(buf) - len, ".%s", seg->lexeme);

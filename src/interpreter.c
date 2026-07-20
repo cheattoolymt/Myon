@@ -14,6 +14,12 @@
  * limitations under the License.
  */
 
+/* Request POSIX.1b clocks/timers (clock_gettime, nanosleep, CLOCK_REALTIME)
+ * from glibc while compiling under strict -std=c11 (Phase4 myon.time). */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 199309L
+#endif
+
 #include "interpreter.h"
 #include "value.h"
 #include "env.h"
@@ -34,6 +40,7 @@
 #include <math.h>
 #include <ctype.h>
 #include <errno.h>
+#include <time.h>
 
 /* Some C standard libraries only expose M_PI / M_E under _GNU_SOURCE or
  * similar feature-test macros; provide portable fallbacks (Phase3.5). */
@@ -79,6 +86,9 @@ struct Interp {
     int          program_count;
     /* Phase3 C FFI subsystem (lazily created on first myon.ffi.* use) */
     FFIState    *ffi;
+    /* Phase4 myon.random: 1 once the PRNG has been seeded (either explicitly
+     * via myon.random.seed() or auto-seeded on first int()/float() use). */
+    int          random_seeded;
 };
 typedef struct Interp Interp;
 
@@ -1012,6 +1022,117 @@ static int call_ffi(Interp *it, Env *env, const char *name, Expr *call, Value *o
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Standard library: myon.time.* (Phase4, Step5)                       */
+/*                                                                     */
+/* Minimal wall-clock helpers built on the C standard library / POSIX  */
+/* clocks.  now()/now_ms() return int64 epoch seconds/milliseconds;    */
+/* sleep_ms() suspends the calling thread (a negative argument is a    */
+/* no-op rather than an error — a simple safe-side convention).        */
+/* ------------------------------------------------------------------ */
+static int call_time(Interp *it, Env *env, const char *name, Expr *call, Value *out) {
+    int line = call->line;
+
+    /* myon.time.now() ret int — UNIX epoch seconds. */
+    if (strcmp(name, "myon.time.now") == 0) {
+        *out = value_int((long long)time(NULL));
+        return 1;
+    }
+
+    /* myon.time.now_ms() ret int — UNIX epoch milliseconds. */
+    if (strcmp(name, "myon.time.now_ms") == 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        long long ms = (long long)ts.tv_sec * 1000 + (long long)ts.tv_nsec / 1000000;
+        *out = value_int(ms);
+        return 1;
+    }
+
+    /* myon.time.sleep_ms(ms) ret void — sleep, negative ms is a no-op. */
+    if (strcmp(name, "myon.time.sleep_ms") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        if (a.type != TYPE_INT) {
+            value_free(&a);
+            runtime_error(it, line, "myon.time.sleep_ms expects (int)");
+        }
+        long long ms = a.as.i;
+        value_free(&a);
+        if (ms > 0) {
+            struct timespec req;
+            req.tv_sec  = (time_t)(ms / 1000);
+            req.tv_nsec = (long)((ms % 1000) * 1000000L);
+            nanosleep(&req, NULL);
+        }
+        *out = value_void();
+        return 1;
+    }
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Standard library: myon.random.* (Phase4, Step6)                     */
+/*                                                                     */
+/* Thin wrapper over the C standard PRNG (srand/rand).  NOT crypto-safe.*/
+/* The PRNG is auto-seeded from the wall clock on first use if the      */
+/* script never calls myon.random.seed() explicitly.                   */
+/* ------------------------------------------------------------------ */
+static void random_ensure_seeded(Interp *it) {
+    if (!it->random_seeded) {
+        srand((unsigned)time(NULL));
+        it->random_seeded = 1;
+    }
+}
+
+static int call_random(Interp *it, Env *env, const char *name, Expr *call, Value *out) {
+    int line = call->line;
+
+    /* myon.random.seed(n) ret void */
+    if (strcmp(name, "myon.random.seed") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        if (a.type != TYPE_INT) {
+            value_free(&a);
+            runtime_error(it, line, "myon.random.seed expects (int)");
+        }
+        srand((unsigned)a.as.i);
+        it->random_seeded = 1;
+        value_free(&a);
+        *out = value_void();
+        return 1;
+    }
+
+    /* myon.random.int(lo, hi) ret int, error — inclusive on both ends. */
+    if (strcmp(name, "myon.random.int") == 0) {
+        Value lo = eval_arg(it, env, call, 0), hi = eval_arg(it, env, call, 1);
+        if (lo.type != TYPE_INT || hi.type != TYPE_INT) {
+            value_free(&lo); value_free(&hi);
+            runtime_error(it, line, "myon.random.int expects (int, int)");
+        }
+        long long lov = lo.as.i, hiv = hi.as.i;
+        value_free(&lo); value_free(&hi);
+        if (lov > hiv) {
+            *out = make_result_pair(value_nil(),
+                value_error(myon_strdup("myon.random.int: lo must be <= hi")));
+            return 1;
+        }
+        random_ensure_seeded(it);
+        unsigned long long span = (unsigned long long)(hiv - lov) + 1ULL;
+        long long v = lov + (long long)((unsigned long long)rand() % span);
+        *out = make_result_pair(value_int(v), value_nil());
+        return 1;
+    }
+
+    /* myon.random.float() ret float — 0.0 <= x < 1.0 */
+    if (strcmp(name, "myon.random.float") == 0) {
+        random_ensure_seeded(it);
+        double v = (double)rand() / ((double)RAND_MAX + 1.0);
+        *out = value_float(v);
+        return 1;
+    }
+
+    return 0;
+}
+
 /* dispatch a "myon.math.<fn>" or "myon.string.<fn>" call.
  * Returns 1 and sets *out if handled. */
 static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value *out) {
@@ -1026,6 +1147,16 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
     /* ---- myon.ffi (C FFI, Phase3) ---- */
     if (strncmp(name, "myon.ffi.", 9) == 0) {
         if (call_ffi(it, env, name, call, out)) return 1;
+    }
+
+    /* ---- myon.time (Phase4, Step5) ---- */
+    if (strncmp(name, "myon.time.", 10) == 0) {
+        if (call_time(it, env, name, call, out)) return 1;
+    }
+
+    /* ---- myon.random (Phase4, Step6) ---- */
+    if (strncmp(name, "myon.random.", 12) == 0) {
+        if (call_random(it, env, name, call, out)) return 1;
     }
 
     /* ---- myon.math ---- */
@@ -1209,6 +1340,95 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
     }
     if (strcmp(name, "myon.math.e") == 0) {
         *out = value_float(M_E); return 1;
+    }
+
+    /* ---- myon.math (Phase4, Step4 — integer number theory) ---- */
+
+    /* gcd(a, b): Euclidean algorithm on absolute values; always >= 0.
+     * gcd(0, 0) is defined here as 0 (mathematically undefined, but a
+     * simple edge-case convention). */
+    if (strcmp(name, "myon.math.gcd") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
+        if (a.type != TYPE_INT || b.type != TYPE_INT) {
+            value_free(&a); value_free(&b);
+            runtime_error(it, line, "myon.math.gcd expects (int, int)");
+        }
+        /* Work in unsigned to avoid llabs(INT64_MIN) undefined behaviour. */
+        unsigned long long x = (a.as.i < 0) ? -(unsigned long long)a.as.i
+                                            :  (unsigned long long)a.as.i;
+        unsigned long long y = (b.as.i < 0) ? -(unsigned long long)b.as.i
+                                            :  (unsigned long long)b.as.i;
+        while (y != 0) { unsigned long long t = x % y; x = y; y = t; }
+        *out = value_int((long long)x);
+        value_free(&a); value_free(&b); return 1;
+    }
+
+    /* lcm(a, b) ret int, error: abs(a / gcd(a,b) * b), dividing first to
+     * limit overflow.  lcm(0, *) == 0.  Overflow -> error. */
+    if (strcmp(name, "myon.math.lcm") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
+        if (a.type != TYPE_INT || b.type != TYPE_INT) {
+            value_free(&a); value_free(&b);
+            runtime_error(it, line, "myon.math.lcm expects (int, int)");
+        }
+        long long av = a.as.i, bv = b.as.i;
+        value_free(&a); value_free(&b);
+        if (av == 0 || bv == 0) {
+            *out = make_result_pair(value_int(0), value_nil());
+            return 1;
+        }
+        unsigned long long x = (av < 0) ? -(unsigned long long)av : (unsigned long long)av;
+        unsigned long long y = (bv < 0) ? -(unsigned long long)bv : (unsigned long long)bv;
+        unsigned long long g = x, gy = y;
+        while (gy != 0) { unsigned long long t = g % gy; g = gy; gy = t; }
+        /* result = (x / g) * y, computed in signed int64 with overflow check */
+        long long q = (long long)(x / g);
+        long long r;
+        if (__builtin_mul_overflow(q, (long long)y, &r) || r < 0) {
+            *out = make_result_pair(value_nil(),
+                value_error(myon_strdup("myon.math.lcm: result overflows int64")));
+        } else {
+            *out = make_result_pair(value_int(r), value_nil());
+        }
+        return 1;
+    }
+
+    /* pow_int(base, exp) ret int, error: exact int64 binary exponentiation.
+     * Negative exp -> error (use myon.math.pow for fractional results).
+     * Overflow at any multiplication -> error. */
+    if (strcmp(name, "myon.math.pow_int") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
+        if (a.type != TYPE_INT || b.type != TYPE_INT) {
+            value_free(&a); value_free(&b);
+            runtime_error(it, line, "myon.math.pow_int expects (int, int)");
+        }
+        long long base = a.as.i, exp = b.as.i;
+        value_free(&a); value_free(&b);
+        if (exp < 0) {
+            *out = make_result_pair(value_nil(),
+                value_error(myon_strdup("myon.math.pow_int: negative exponent (use myon.math.pow for fractional results)")));
+            return 1;
+        }
+        long long result = 1;
+        long long acc = base;
+        long long e = exp;
+        int overflow = 0;
+        while (e > 0) {
+            if (e & 1) {
+                if (__builtin_mul_overflow(result, acc, &result)) { overflow = 1; break; }
+            }
+            e >>= 1;
+            if (e > 0) {
+                if (__builtin_mul_overflow(acc, acc, &acc)) { overflow = 1; break; }
+            }
+        }
+        if (overflow) {
+            *out = make_result_pair(value_nil(),
+                value_error(myon_strdup("myon.math.pow_int: result overflows int64")));
+        } else {
+            *out = make_result_pair(value_int(result), value_nil());
+        }
+        return 1;
     }
 
     /* ---- myon.string ---- */
@@ -2556,7 +2776,8 @@ static Flow exec_block(Interp *it, Env *env, StmtList *body) {
 /* ------------------------------------------------------------------ */
 
 static const char *BUILTIN_MODULES[] = {
-    "myon.stdio", "myon.math", "myon.string", "myon.ffi", NULL
+    "myon.stdio", "myon.math", "myon.string", "myon.ffi",
+    "myon.time", "myon.random", NULL
 };
 
 static int is_builtin_module(const char *path) {
