@@ -1,0 +1,22 @@
+# Phase3.1: myon.ffi.read_i64 reads 8 bytes as a little-endian int64.
+#
+# Write the ASCII bytes "ABCDEFGH" (0x41..0x48) into a block, then read the
+# first 8 bytes as an int64.  Little-endian assembly of 0x41..0x48 gives
+# 0x4847464544434241 == 5208208757389214273.
+module myon.ffi
+
+id, aerr = myon.ffi.alloc(16)
+myon.if aerr != myon.nil then { myon.print(str("alloc_err")) } myon.else { myon.print(str("alloc_ok")) }
+
+w, we = myon.ffi.write_bytes(id, 0, str("ABCDEFGH"))
+myon.print(w)
+
+v, re = myon.ffi.read_i64(id, 0)
+myon.print(v)
+
+# Reading past the end of the block must error, not crash.
+bad, be = myon.ffi.read_i64(id, 12)
+myon.if be != myon.nil then { myon.print(str("oob_err")) } myon.else { myon.print(str("oob_ok")) }
+
+f, fe = myon.ffi.free(id)
+myon.print(f)

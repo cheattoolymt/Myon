@@ -831,6 +831,108 @@ static int call_ffi(Interp *it, Env *env, const char *name, Expr *call, Value *o
         return 1;
     }
 
+    /* myon.ffi.write_bytes(block_id, offset, data) ret bool, error  (Phase3.1)
+     *
+     * Writes the bytes of the Myon str `data` into a previously allocated
+     * memory block.  Myon's str is a NUL-terminated char* (no length field),
+     * so the write covers strlen(data) bytes — embedded NUL bytes truncate.
+     * This limitation is documented in docs/myon_spec.md (10.3.1). */
+    if (strcmp(name, "myon.ffi.write_bytes") == 0) {
+        Value bv = eval_arg(it, env, call, 0);
+        Value ov = eval_arg(it, env, call, 1);
+        Value dv = eval_arg(it, env, call, 2);
+        if (bv.type != TYPE_INT || ov.type != TYPE_INT || dv.type != TYPE_STR) {
+            value_free(&bv); value_free(&ov); value_free(&dv);
+            *out = make_result_pair(value_bool(0),
+                value_error(myon_strdup(
+                    "ffi.write_bytes expects (int block_id, int offset, str data)")));
+            return 1;
+        }
+        long long block_id = bv.as.i;
+        long long offset   = ov.as.i;
+        const char *data   = dv.as.obj->as.str;
+        long long len      = (long long)strlen(data);
+        value_free(&bv); value_free(&ov);
+        int ok = ffi_mem_write(ffi_get_state(it), block_id, offset,
+                               (const unsigned char *)data, len);
+        value_free(&dv);
+        if (!ok) {
+            *out = make_result_pair(value_bool(0),
+                value_error(myon_strdup(
+                    "ffi.write_bytes: invalid block id or out-of-range write")));
+        } else {
+            *out = make_result_pair(value_bool(1), value_nil());
+        }
+        return 1;
+    }
+
+    /* myon.ffi.read_bytes(block_id, offset, len) ret str, error  (Phase3.1)
+     *
+     * Reads `len` bytes from a block into a Myon str.  Because str is
+     * NUL-terminated, the result is best-effort for binary data (an embedded
+     * NUL byte truncates the visible string). */
+    if (strcmp(name, "myon.ffi.read_bytes") == 0) {
+        Value bv = eval_arg(it, env, call, 0);
+        Value ov = eval_arg(it, env, call, 1);
+        Value lv = eval_arg(it, env, call, 2);
+        if (bv.type != TYPE_INT || ov.type != TYPE_INT || lv.type != TYPE_INT) {
+            value_free(&bv); value_free(&ov); value_free(&lv);
+            *out = make_result_pair(value_str(myon_strdup("")),
+                value_error(myon_strdup(
+                    "ffi.read_bytes expects (int block_id, int offset, int len)")));
+            return 1;
+        }
+        long long block_id = bv.as.i;
+        long long offset   = ov.as.i;
+        long long len      = lv.as.i;
+        value_free(&bv); value_free(&ov); value_free(&lv);
+        if (len < 0) {
+            *out = make_result_pair(value_str(myon_strdup("")),
+                value_error(myon_strdup("ffi.read_bytes: len must be non-negative")));
+            return 1;
+        }
+        unsigned char *buf = ffi_mem_read(ffi_get_state(it), block_id, offset, len);
+        if (!buf) {
+            *out = make_result_pair(value_str(myon_strdup("")),
+                value_error(myon_strdup(
+                    "ffi.read_bytes: invalid block id or out-of-range read")));
+        } else {
+            /* buf is NUL-terminated by ffi_mem_read; hand it to value_str. */
+            *out = make_result_pair(value_str((char *)buf), value_nil());
+        }
+        return 1;
+    }
+
+    /* myon.ffi.read_i64(block_id, offset) ret int, error  (Phase3.1)
+     *
+     * Reads 8 bytes as a little-endian int64.  Convenience for pulling an
+     * out-parameter pointer (e.g. sqlite3* from sqlite3_open) out of a block
+     * as a plain address value. */
+    if (strcmp(name, "myon.ffi.read_i64") == 0) {
+        Value bv = eval_arg(it, env, call, 0);
+        Value ov = eval_arg(it, env, call, 1);
+        if (bv.type != TYPE_INT || ov.type != TYPE_INT) {
+            value_free(&bv); value_free(&ov);
+            *out = make_result_pair(value_int(0),
+                value_error(myon_strdup(
+                    "ffi.read_i64 expects (int block_id, int offset)")));
+            return 1;
+        }
+        long long block_id = bv.as.i;
+        long long offset   = ov.as.i;
+        value_free(&bv); value_free(&ov);
+        long long v = 0;
+        int ok = ffi_mem_read_i64(ffi_get_state(it), block_id, offset, &v);
+        if (!ok) {
+            *out = make_result_pair(value_int(0),
+                value_error(myon_strdup(
+                    "ffi.read_i64: invalid block id or out-of-range read")));
+        } else {
+            *out = make_result_pair(value_int(v), value_nil());
+        }
+        return 1;
+    }
+
     return 0;
 }
 

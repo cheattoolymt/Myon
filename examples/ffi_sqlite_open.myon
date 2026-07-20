@@ -1,0 +1,37 @@
+# Phase3.1 FFI example: out-parameter (double-pointer) call.
+#
+# Demonstrates the pattern that segfaulted under Phase3: sqlite3_open() writes a
+# `sqlite3*` handle through its second argument.  With Phase3.1 we allocate an
+# 8-byte block, pass it with the 'b' signature char (block id -> real address),
+# then read the written pointer back out as a little-endian int64.
+#
+# Requires libsqlite3 to be installed (libsqlite3.so.0).  Because that library
+# is not guaranteed to be present in CI, this lives in examples/ rather than in
+# tests/cases/.
+module myon.ffi
+
+handle, err = myon.ffi.load(str("libsqlite3.so.0"))
+myon.if err != myon.nil then { myon.print(str("load failed")) } myon.else { myon.print(str("loaded")) }
+
+# sqlite3 *db is written back to us; reserve 8 bytes (x86-64 pointer size).
+outblock, aerr = myon.ffi.alloc(8)
+
+# int sqlite3_open(const char *filename, sqlite3 **ppDb)
+# sig "sb": string filename + buffer (block id) out-parameter.
+rc, oerr = myon.ffi.call_i(handle, str("sqlite3_open"),
+                           str("sb"), str(":memory:"), outblock)
+myon.print(str("sqlite3_open rc:"))
+myon.print(rc)                          # 0 (SQLITE_OK) expected
+
+# Pull the written sqlite3* out of the block as a raw address value.
+db_addr, re = myon.ffi.read_i64(outblock, 0)
+myon.print(str("db handle address:"))
+myon.print(db_addr)                     # non-zero expected
+
+# int sqlite3_close(sqlite3 *db) — db_addr is a raw address, so use 'p'.
+crc, cerr = myon.ffi.call_i(handle, str("sqlite3_close"), str("p"), db_addr)
+myon.print(str("sqlite3_close rc:"))
+myon.print(crc)                         # 0 expected
+
+freed, ferr = myon.ffi.free(outblock)
+ok, clerr = myon.ffi.close(handle)
