@@ -1,0 +1,18 @@
+# Phase3.1: myon.ffi.alloc / free lifecycle.
+# alloc returns a non-negative block id; the first free succeeds (true),
+# a second free of the same id surfaces an error (false); alloc(0) errors.
+module myon.ffi
+
+id, err = myon.ffi.alloc(64)
+myon.if err != myon.nil then { myon.print(str("alloc_err")) } myon.else { myon.print(str("alloc_ok")) }
+myon.if id >= 0 then { myon.print(str("id_ok")) } myon.else { myon.print(str("id_bad")) }
+
+ok1, e1 = myon.ffi.free(id)
+myon.print(ok1)
+
+ok2, e2 = myon.ffi.free(id)
+myon.print(ok2)
+myon.if e2 != myon.nil then { myon.print(str("refree_err")) } myon.else { myon.print(str("refree_ok")) }
+
+bad, be = myon.ffi.alloc(0)
+myon.if be != myon.nil then { myon.print(str("zero_err")) } myon.else { myon.print(str("zero_ok")) }

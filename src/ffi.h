@@ -48,4 +48,45 @@ void *ffi_lookup_symbol(FFIState *st, long long handle,
 /* Close a handle.  Returns 1 on success, 0 for an invalid/closed handle. */
 int ffi_close(FFIState *st, long long handle);
 
+/*
+ * Phase3.1 — raw memory blocks.
+ *
+ * These let Myon scripts obtain writable scratch memory to hand to C
+ * functions (out-parameters, byte buffers, ...) without ever exposing a raw
+ * pointer to the script layer.  Blocks are tracked inside FFIState with the
+ * same handle-ID discipline as loaded libraries: alloc hands out a
+ * non-negative block ID, and everything else is addressed through that ID.
+ * The real address is only materialised internally (via ffi_mem_ptr) when a
+ * block is passed to a C call, so an invalid ID can never crash the callee.
+ */
+
+/*
+ * Allocate `size` zero-initialised bytes and return a non-negative block ID.
+ * Returns -1 on failure (size <= 0 or out of memory).
+ */
+long long ffi_mem_alloc(FFIState *st, long long size);
+
+/*
+ * Resolve a block ID to its raw pointer.  Returns NULL for an invalid or
+ * already-freed ID.  Internal use only — never exposed to Myon scripts.
+ */
+void *ffi_mem_ptr(FFIState *st, long long block_id);
+
+/* Size of the block in bytes, or -1 for an invalid/freed ID. */
+long long ffi_mem_size(FFIState *st, long long block_id);
+
+/* Free a block.  Returns 1 on success, 0 for an invalid/already-freed ID. */
+int ffi_mem_free(FFIState *st, long long block_id);
+
+/*
+ * Phase3.1 — read a NUL-terminated C string from a raw address.
+ *
+ * `addr` is a *raw C address value* (as returned by call_p or another
+ * call_*), NOT a block ID — the two are separate namespaces.  Reads at most
+ * `max_len` bytes and returns a freshly heap-allocated copy (caller frees).
+ * Returns NULL if addr is 0 (NULL).  Passing a bogus non-zero address may
+ * crash — this phase does not install signal handlers.
+ */
+char *ffi_read_cstring(long long addr, long long max_len);
+
 #endif /* MYON_FFI_H */

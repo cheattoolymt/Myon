@@ -1,0 +1,35 @@
+# Phase3.1 C FFI demo: read a C string returned by a library function.
+#
+# `const char *zlibVersion(void)` returns a pointer to a static C string.
+# call_p gives us the raw address; myon.ffi.read_cstr dereferences it into a
+# Myon `str`.
+#
+# Run with:  ./myon examples/ffi_zlib_version.myon
+# (libz.so.1 ships on virtually every Linux system.)
+
+module myon.ffi
+
+handle, err = myon.ffi.load(str("libz.so.1"))
+myon.if err != myon.nil then {
+    myon.print(str("load failed"))
+} myon.else {
+    myon.print(str("loaded libz"))
+}
+
+# zlibVersion() returns const char* -> call_p yields the raw address value.
+verptr, e1 = myon.ffi.call_p(handle, str("zlibVersion"), str(""))
+
+# Dereference that address into a Myon str (read at most 64 bytes).
+version_str, e2 = myon.ffi.read_cstr(verptr, 64)
+myon.print(version_str)                 # e.g. "1.3.1"
+
+# Passing a NULL (0) address is rejected with an error, never a crash.
+nullres, e3 = myon.ffi.read_cstr(0, 64)
+myon.if e3 != myon.nil then {
+    myon.print(str("read_cstr(0) errored as expected"))
+} myon.else {
+    myon.print(str("unexpected: no error on NULL"))
+}
+
+ok, clerr = myon.ffi.close(handle)
+myon.print(ok)

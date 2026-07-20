@@ -58,6 +58,24 @@ P2・P6・P7 は仕様書（`docs/myon_spec.md`）の更新で完了です。
 | Step 4 | Myon 言語結合（`module myon.ffi`：`load`/`close`/`call_i`/`call_d`/`call_p`/`call_v`） | ✅ 実装 |
 | Step 5 | 回帰テスト・ドキュメント仕上げ | ✅ 実装 |
 
+### Phase 3.1（FFI 拡張 — メモリ確保・文字列デリファレンス・バッファ引数）
+
+| ステップ | 内容 | 状態 |
+|---|---|---|
+| Step 1 | メモリ確保・解放プリミティブ（`myon.ffi.alloc` / `myon.ffi.free`、`src/ffi.{h,c}`） | ✅ 実装 |
+| Step 2 | sig シグネチャへの `'b'`（バッファ／ブロックID引数）追加、out 引数対応 | ✅ 実装 |
+| Step 3 | 文字列デリファレンス（`myon.ffi.read_cstr`、`ffi_read_cstring`） | ✅ 実装 |
+| Step 4 | バイト列読み書き（`myon.ffi.write_bytes` / `read_bytes`） | ⏳ 未着手 |
+| Step 5 | 安全性の見直しとドキュメント整備 | ⏳ 未着手 |
+| Step 6 | 実地検証（`sqlite3_open`）とテスト追加 | ⏳ 未着手 |
+
+Phase 3.1 では、Myon 側から C に渡すための生メモリ領域を確保・解放できる
+`myon.ffi.alloc` / `myon.ffi.free`、確保したブロックを sig `'b'` で C 関数へ渡す
+仕組み（`sqlite3_open` のような「出力引数」対応）、`const char*` の戻り値を Myon の
+`str` に読み出す `myon.ffi.read_cstr` を追加しました。回帰テストは環境非依存の
+`libz`（`tests/cases/p31_ffi_read_cstr`）と純粋なメモリ管理（`tests/cases/p31_ffi_alloc_free`）
+を用います。文字列を返す C 関数の例は `examples/ffi_zlib_version.myon` にあります。
+
 `module myon.ffi` を宣言すると、ビルド済みの共有ライブラリ（Linux の `.so` など）に
 含まれる C 関数を実行時に呼び出せます。対応する値の型は `int` / `float` / ポインタ（`int`
 として表現）/ `str` の4種類で、構造体の値渡し・値返しは対象外です。対応 OS は Linux
