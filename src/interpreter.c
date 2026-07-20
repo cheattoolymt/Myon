@@ -34,6 +34,15 @@
 #include <math.h>
 #include <ctype.h>
 
+/* Some C standard libraries only expose M_PI / M_E under _GNU_SOURCE or
+ * similar feature-test macros; provide portable fallbacks (Phase3.5). */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#ifndef M_E
+#define M_E 2.71828182845904523536
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Interpreter state and control-flow signalling                       */
 /* ------------------------------------------------------------------ */
@@ -431,6 +440,45 @@ static double as_number(Interp *it, int line, Value v) {
     if (v.type == TYPE_FLOAT) return v.as.f;
     runtime_error(it, line, "expected a numeric argument, got %s", type_name(v.type));
     return 0;
+}
+
+/* Numeric type-preservation helper (Phase3.5, Step1).
+ * Returns 1 when *both* arguments are TYPE_INT (so the caller can compute the
+ * result in int precision without a lossy round-trip through double), and 0
+ * when at least one operand is a float.  Non-numeric arguments raise a
+ * runtime_error, exactly like as_number(). */
+static int both_int(Interp *it, int line, Value a, Value b) {
+    (void)as_number(it, line, a); /* reuse as_number purely for its type check */
+    (void)as_number(it, line, b);
+    return a.type == TYPE_INT && b.type == TYPE_INT;
+}
+
+/* UTF-8 helpers (Phase3.5, Step2).
+ * Count the number of Unicode code points in a NUL-terminated UTF-8 byte
+ * string.  Robust against malformed sequences: an invalid lead/continuation
+ * byte is counted as a single character rather than crashing or looping
+ * forever (Myon str values may carry arbitrary bytes via FFI). */
+static long long utf8_char_count(const char *s) {
+    long long count = 0;
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        unsigned char c = *p;
+        int extra;
+        if      ((c & 0x80) == 0x00) extra = 0; /* 0xxxxxxx */
+        else if ((c & 0xE0) == 0xC0) extra = 1; /* 110xxxxx */
+        else if ((c & 0xF0) == 0xE0) extra = 2; /* 1110xxxx */
+        else if ((c & 0xF8) == 0xF0) extra = 3; /* 11110xxx */
+        else { p++; count++; continue; }        /* invalid lead byte */
+        p++;
+        int ok = 1;
+        for (int k = 0; k < extra; k++) {
+            if ((*p & 0xC0) != 0x80) { ok = 0; break; }
+            p++;
+        }
+        (void)ok; /* robustness first: count one code point regardless */
+        count++;
+    }
+    return count;
 }
 
 /* Build a 2-value tuple (value, error) for the Rust/Go-style return
@@ -970,33 +1018,183 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
     }
     if (strcmp(name, "myon.math.floor") == 0) {
         Value a = eval_arg(it, env, call, 0);
+        /* floor(int) == int: skip the lossy double round-trip (Step1). */
+        if (a.type == TYPE_INT) { *out = value_int(a.as.i); value_free(&a); return 1; }
         *out = value_int((long long)floor(as_number(it, line, a))); value_free(&a); return 1;
     }
     if (strcmp(name, "myon.math.ceil") == 0) {
         Value a = eval_arg(it, env, call, 0);
+        /* ceil(int) == int: skip the lossy double round-trip (Step1). */
+        if (a.type == TYPE_INT) { *out = value_int(a.as.i); value_free(&a); return 1; }
         *out = value_int((long long)ceil(as_number(it, line, a))); value_free(&a); return 1;
     }
     if (strcmp(name, "myon.math.max") == 0) {
         Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
-        double x = as_number(it, line, a), y = as_number(it, line, b);
-        int use_int = (a.type == TYPE_INT && b.type == TYPE_INT);
-        *out = use_int ? value_int(x > y ? (long long)x : (long long)y)
-                       : value_float(x > y ? x : y);
+        if (both_int(it, line, a, b)) {
+            /* Compare in int64 precision — no double round-trip, so values
+             * above 2^53 are handled exactly (Step1). */
+            *out = value_int(a.as.i > b.as.i ? a.as.i : b.as.i);
+        } else {
+            double x = as_number(it, line, a), y = as_number(it, line, b);
+            *out = value_float(x > y ? x : y);
+        }
         value_free(&a); value_free(&b); return 1;
     }
     if (strcmp(name, "myon.math.min") == 0) {
         Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
-        double x = as_number(it, line, a), y = as_number(it, line, b);
-        int use_int = (a.type == TYPE_INT && b.type == TYPE_INT);
-        *out = use_int ? value_int(x < y ? (long long)x : (long long)y)
-                       : value_float(x < y ? x : y);
+        if (both_int(it, line, a, b)) {
+            *out = value_int(a.as.i < b.as.i ? a.as.i : b.as.i);
+        } else {
+            double x = as_number(it, line, a), y = as_number(it, line, b);
+            *out = value_float(x < y ? x : y);
+        }
         value_free(&a); value_free(&b); return 1;
+    }
+
+    /* ---- myon.math (Phase3.5 extension, Step3) ---- */
+
+    /* Trigonometric / inverse-trig (radians, always float). */
+    if (strcmp(name, "myon.math.sin") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        *out = value_float(sin(as_number(it, line, a))); value_free(&a); return 1;
+    }
+    if (strcmp(name, "myon.math.cos") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        *out = value_float(cos(as_number(it, line, a))); value_free(&a); return 1;
+    }
+    if (strcmp(name, "myon.math.tan") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        *out = value_float(tan(as_number(it, line, a))); value_free(&a); return 1;
+    }
+    if (strcmp(name, "myon.math.asin") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        *out = value_float(asin(as_number(it, line, a))); value_free(&a); return 1;
+    }
+    if (strcmp(name, "myon.math.acos") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        *out = value_float(acos(as_number(it, line, a))); value_free(&a); return 1;
+    }
+    if (strcmp(name, "myon.math.atan") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        *out = value_float(atan(as_number(it, line, a))); value_free(&a); return 1;
+    }
+    if (strcmp(name, "myon.math.atan2") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
+        *out = value_float(atan2(as_number(it, line, a), as_number(it, line, b)));
+        value_free(&a); value_free(&b); return 1;
+    }
+
+    /* Logarithms / exponential (always float). */
+    if (strcmp(name, "myon.math.log") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        *out = value_float(log(as_number(it, line, a))); value_free(&a); return 1;
+    }
+    if (strcmp(name, "myon.math.log2") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        *out = value_float(log2(as_number(it, line, a))); value_free(&a); return 1;
+    }
+    if (strcmp(name, "myon.math.log10") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        *out = value_float(log10(as_number(it, line, a))); value_free(&a); return 1;
+    }
+    if (strcmp(name, "myon.math.exp") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        *out = value_float(exp(as_number(it, line, a))); value_free(&a); return 1;
+    }
+
+    /* round / trunc: always return int; int input passes through unchanged. */
+    if (strcmp(name, "myon.math.round") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        if (a.type == TYPE_INT) { *out = value_int(a.as.i); value_free(&a); return 1; }
+        *out = value_int((long long)round(as_number(it, line, a))); value_free(&a); return 1;
+    }
+    if (strcmp(name, "myon.math.trunc") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        if (a.type == TYPE_INT) { *out = value_int(a.as.i); value_free(&a); return 1; }
+        *out = value_int((long long)trunc(as_number(it, line, a))); value_free(&a); return 1;
+    }
+
+    /* mod: int% for two ints, fmod otherwise; division by zero returns a
+     * (value, error) pair rather than raising a runtime_error. */
+    if (strcmp(name, "myon.math.mod") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
+        if (both_int(it, line, a, b)) {
+            if (b.as.i == 0) {
+                *out = make_result_pair(value_nil(), value_error(myon_strdup("division by zero")));
+            } else {
+                *out = make_result_pair(value_int(a.as.i % b.as.i), value_nil());
+            }
+        } else {
+            double x = as_number(it, line, a), y = as_number(it, line, b);
+            if (y == 0.0) {
+                *out = make_result_pair(value_nil(), value_error(myon_strdup("division by zero")));
+            } else {
+                *out = make_result_pair(value_float(fmod(x, y)), value_nil());
+            }
+        }
+        value_free(&a); value_free(&b); return 1;
+    }
+
+    /* sign: +1 / -1 / 0, always int; int input uses int comparison only. */
+    if (strcmp(name, "myon.math.sign") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        long long s;
+        if (a.type == TYPE_INT) {
+            s = (a.as.i > 0) - (a.as.i < 0);
+        } else {
+            double x = as_number(it, line, a);
+            s = (x > 0.0) - (x < 0.0);
+        }
+        *out = value_int(s); value_free(&a); return 1;
+    }
+
+    /* clamp(x, lo, hi): int math when all three are int, else float.
+     * hi < lo is defined to always return hi. */
+    if (strcmp(name, "myon.math.clamp") == 0) {
+        Value x = eval_arg(it, env, call, 0);
+        Value lo = eval_arg(it, env, call, 1);
+        Value hi = eval_arg(it, env, call, 2);
+        int all_int = (x.type == TYPE_INT && lo.type == TYPE_INT && hi.type == TYPE_INT);
+        /* Type-check every operand even in the float path. */
+        (void)as_number(it, line, x);
+        (void)as_number(it, line, lo);
+        (void)as_number(it, line, hi);
+        if (all_int) {
+            long long xv = x.as.i, lv = lo.as.i, hv = hi.as.i;
+            long long r = xv < lv ? lv : (xv > hv ? hv : xv);
+            if (hv < lv) r = hv;
+            *out = value_int(r);
+        } else {
+            double xv = as_number(it, line, x);
+            double lv = as_number(it, line, lo);
+            double hv = as_number(it, line, hi);
+            double r = xv < lv ? lv : (xv > hv ? hv : xv);
+            if (hv < lv) r = hv;
+            *out = value_float(r);
+        }
+        value_free(&x); value_free(&lo); value_free(&hi); return 1;
+    }
+
+    /* Constants exposed as 0-argument functions. */
+    if (strcmp(name, "myon.math.pi") == 0) {
+        *out = value_float(M_PI); return 1;
+    }
+    if (strcmp(name, "myon.math.e") == 0) {
+        *out = value_float(M_E); return 1;
     }
 
     /* ---- myon.string ---- */
     if (strcmp(name, "myon.string.length") == 0) {
+        /* Unicode code-point count, not byte count (Step2). */
         Value a = eval_arg(it, env, call, 0);
         if (a.type != TYPE_STR) { value_free(&a); runtime_error(it, line, "myon.string.length expects str"); }
+        *out = value_int(utf8_char_count(a.as.obj->as.str));
+        value_free(&a); return 1;
+    }
+    if (strcmp(name, "myon.string.byte_length") == 0) {
+        /* Raw byte length (strlen), for callers that need the encoded size. */
+        Value a = eval_arg(it, env, call, 0);
+        if (a.type != TYPE_STR) { value_free(&a); runtime_error(it, line, "myon.string.byte_length expects str"); }
         *out = value_int((long long)strlen(a.as.obj->as.str));
         value_free(&a); return 1;
     }
