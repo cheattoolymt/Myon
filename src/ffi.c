@@ -19,6 +19,7 @@
 #include "common.h"
 
 #include <stddef.h>
+#include <string.h>
 
 /*
  * A loaded-library slot.  Handle IDs are the index into `slots`; a NULL `lib`
@@ -26,10 +27,26 @@
  * ModuleEntry-style bookkeeping used elsewhere in the interpreter but is kept
  * as a growable array for O(1) handle lookup.
  */
+/*
+ * A raw memory block (Phase3.1).  Block IDs are the index into `blocks`; a
+ * NULL `ptr` marks a never-used or already-freed slot.  Mirrors the loaded-
+ * library slot bookkeeping above: IDs are handed out in allocation order and
+ * never recycled once freed.
+ */
+typedef struct {
+    void      *ptr;   /* NULL == free/retired slot */
+    long long  size;  /* allocation size in bytes */
+} FFIMemBlock;
+
 struct FFIState {
     FFILib **slots;
     int      count;    /* number of allocated slots (== next handle ID) */
     int      capacity;
+
+    /* Phase3.1 raw memory blocks. */
+    FFIMemBlock *blocks;
+    int          block_count;    /* == next block ID */
+    int          block_capacity;
 };
 
 FFIState *ffi_state_create(void) {
@@ -37,6 +54,9 @@ FFIState *ffi_state_create(void) {
     st->slots = NULL;
     st->count = 0;
     st->capacity = 0;
+    st->blocks = NULL;
+    st->block_count = 0;
+    st->block_capacity = 0;
     return st;
 }
 
@@ -46,7 +66,69 @@ void ffi_state_free(FFIState *st) {
         if (st->slots[i]) ffi_platform_close(st->slots[i]);
     }
     free(st->slots);
+    /* free any memory blocks the script forgot to release (leak guard) */
+    for (int i = 0; i < st->block_count; i++) {
+        if (st->blocks[i].ptr) free(st->blocks[i].ptr);
+    }
+    free(st->blocks);
     free(st);
+}
+
+/* ---- Phase3.1 raw memory blocks ---- */
+
+long long ffi_mem_alloc(FFIState *st, long long size) {
+    if (size <= 0) return -1;
+
+    void *mem = malloc((size_t)size);
+    if (!mem) return -1;
+    memset(mem, 0, (size_t)size); /* zero-clear (calloc-equivalent) */
+
+    if (st->block_count >= st->block_capacity) {
+        int newcap = st->block_capacity ? st->block_capacity * 2 : 4;
+        st->blocks = (FFIMemBlock *)myon_xrealloc(
+            st->blocks, sizeof(FFIMemBlock) * (size_t)newcap);
+        st->block_capacity = newcap;
+    }
+    long long id = st->block_count;
+    st->blocks[st->block_count].ptr = mem;
+    st->blocks[st->block_count].size = size;
+    st->block_count++;
+    return id;
+}
+
+void *ffi_mem_ptr(FFIState *st, long long block_id) {
+    if (block_id < 0 || block_id >= st->block_count) return NULL;
+    return st->blocks[block_id].ptr; /* NULL if freed/retired */
+}
+
+long long ffi_mem_size(FFIState *st, long long block_id) {
+    if (block_id < 0 || block_id >= st->block_count) return -1;
+    if (!st->blocks[block_id].ptr) return -1; /* freed */
+    return st->blocks[block_id].size;
+}
+
+int ffi_mem_free(FFIState *st, long long block_id) {
+    if (block_id < 0 || block_id >= st->block_count) return 0;
+    if (!st->blocks[block_id].ptr) return 0; /* already freed */
+    free(st->blocks[block_id].ptr);
+    st->blocks[block_id].ptr = NULL; /* retire; never reused */
+    st->blocks[block_id].size = 0;
+    return 1;
+}
+
+char *ffi_read_cstring(long long addr, long long max_len) {
+    if (addr == 0) return NULL; /* NULL pointer */
+    if (max_len <= 0) return NULL;
+
+    const char *src = (const char *)(size_t)addr;
+    /* Bounded scan for the NUL terminator (avoids runaway reads). */
+    long long n = 0;
+    while (n < max_len && src[n] != '\0') n++;
+
+    char *dst = (char *)myon_xmalloc((size_t)n + 1);
+    memcpy(dst, src, (size_t)n);
+    dst[n] = '\0';
+    return dst;
 }
 
 long long ffi_load(FFIState *st, const char *path, char **err_msg) {

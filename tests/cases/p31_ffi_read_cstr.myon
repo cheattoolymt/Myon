@@ -1,0 +1,26 @@
+# Phase3.1: myon.ffi.read_cstr dereferences a const char* returned by a C fn.
+# Uses libz's zlibVersion(), which returns a static version string on virtually
+# every Linux system.  The version text itself varies across environments, so
+# this test asserts behaviour (no error on a valid ptr, error on NULL) rather
+# than the exact string.
+module myon.ffi
+
+handle, err = myon.ffi.load(str("libz.so.1"))
+myon.if err != myon.nil then { myon.print(str("LOAD_FAIL")) } myon.else { myon.print(str("loaded")) }
+
+verptr, e1 = myon.ffi.call_p(handle, str("zlibVersion"), str(""))
+myon.if verptr != 0 then { myon.print(str("ptr_ok")) } myon.else { myon.print(str("ptr_null")) }
+
+version_str, e2 = myon.ffi.read_cstr(verptr, 64)
+myon.if e2 != myon.nil then { myon.print(str("read_err")) } myon.else { myon.print(str("read_ok")) }
+
+# NULL address must error, not crash.
+nullres, e3 = myon.ffi.read_cstr(0, 64)
+myon.if e3 != myon.nil then { myon.print(str("null_err")) } myon.else { myon.print(str("null_ok")) }
+
+# Over-limit max_len must error.
+over, e4 = myon.ffi.read_cstr(verptr, 99999999)
+myon.if e4 != myon.nil then { myon.print(str("limit_err")) } myon.else { myon.print(str("limit_ok")) }
+
+ok, ce = myon.ffi.close(handle)
+myon.print(ok)

@@ -463,6 +463,20 @@ myon.print(myon.file.exists("/tmp/does_not_exist.txt"))  // false
 | `d`  | `double`             | `float`（`int` も可、自動的に `double` へ変換） |
 | `p`  | `void*`（不透明ポインタ） | `int`（ポインタ値をそのまま整数として保持） |
 | `s`  | `const char*`        | `str` |
+| `b`  | `void*`（Myonが確保したメモリブロックを指す, **Phase3.1**） | `int`（`myon.ffi.alloc` が返すブロックID） |
+
+`'b'` と `'p'` の違い（Phase3.1）:
+
+- `'p'` は「Cが返してきた生アドレス値をそのまま `int64` として受け渡すだけ」で、
+  Myon側はそのブロックの中身を一切関知しない。
+- `'b'` は「Myon側の `myon.ffi.alloc` で確保したブロックIDを渡すと、C呼び出しの
+  直前にFFI層がそのブロックの実際のメモリアドレスに変換してからC関数に渡す」。
+  これにより `sqlite3_open(path, &db)` のような「出力引数（ダブルポインタ）」に、
+  Myonが確保した書き込み可能な領域のアドレスを安全に渡せる。
+  `'b'` に `myon.ffi.alloc`（や `load`）が発行していない不正な値を渡した場合は
+  `error` を返す（クラッシュを防ぐガード）。
+- 引数の並び順の制約において、`'b'` は `'i'`/`'p'`/`'s'` と同じ「整数系」グループに
+  属する（`double` 引数より前に置く）。
 
 例: `"id"` は「`int` 引数を1つ、`double` 引数を1つ」の意味。
 戻り値の型は関数名で分ける（`call_i` / `call_d` / `call_p` / `call_v`）。
@@ -515,6 +529,76 @@ ok, clerr = myon.ffi.close(handle)
 
 - 一度 `close` したハンドルIDは再利用されない。閉じ済みハンドルへの
   再アクセス（再 `close` や `call_*`）は `error` を返す。
+
+#### 10.3.1 メモリ確保・文字列デリファレンス（Phase3.1）
+
+Phase3のFFIだけでは、(1) 文字列を返すC関数の中身を読めない、(2) 出力引数
+（ダブルポインタ）を取るC関数にNULLしか渡せずクラッシュする、といった
+制約があった。Phase3.1では以下を追加してこれらに対応する。
+
+| 関数 | シグネチャ | 説明 |
+|------|-----------|------|
+| `myon.ffi.alloc`     | `myon.ffi.alloc(size: int) ret int, error`               | `size` バイトのゼロ初期化済みメモリを確保し、非負のブロックID（`int`）を返す。`size` が0以下なら `error` |
+| `myon.ffi.free`      | `myon.ffi.free(block_id: int) ret bool, error`           | ブロックを解放する（成功時 `true`）。無効／解放済みIDは `error` |
+| `myon.ffi.read_cstr` | `myon.ffi.read_cstr(addr: int, max_len: int) ret str, error` | 生アドレス `addr` が指すNUL終端C文字列を `str` として読み出す |
+
+**ブロックIDと生アドレスは別の名前空間**
+
+`myon.ffi.alloc` が返す「ブロックID」は、MyonのFFI層が内部で管理する番号で
+あり、Cから見た実際のメモリアドレスとは異なる（`myon.ffi.load` のハンドルIDと
+同じ考え方）。Myonスクリプト側に生ポインタは一切公開されない。C関数の引数として
+メモリのアドレスを渡したい場面では、sig文字に `'b'` を使うことで、FFI層が
+呼び出し直前にブロックID→実アドレスへ変換する。
+
+一方、`call_p` の戻り値や `read_cstr` の第1引数 `addr` は「Cの生アドレス値」で
+あり、ブロックIDではない。
+
+**`myon.ffi.read_cstr` の詳細**
+
+- `max_len` で読み取る最大バイト数を制限する（暴走読み取り防止）。上限は
+  16MB（16777216）で、これを超える値や0以下の値を指定すると `error` を返す。
+- `addr` が `0`（NULL相当）の場合は `error` を返す（クラッシュしない）。
+- ただし `0` 以外の**不正な**アドレスを渡した場合はクラッシュしうる。
+  本フェーズでは signal handler 等による保護は行わない（呼び出し側が
+  `call_*` から得た正しいアドレスを渡す責任を持つ）。
+
+```myon
+module myon.ffi
+
+handle, err = myon.ffi.load(str("libz.so.1"))
+
+# const char *zlibVersion(void) -> call_p で生アドレスを得る
+verptr, e1 = myon.ffi.call_p(handle, str("zlibVersion"), str(""))
+
+# 生アドレスを Myon の str にデリファレンス（最大64バイト）
+version_str, e2 = myon.ffi.read_cstr(verptr, 64)
+myon.print(version_str)                 # 例: "1.3.1"
+
+ok, clerr = myon.ffi.close(handle)
+```
+
+**出力引数（ダブルポインタ）の呼び出し例**
+
+`myon.ffi.alloc` で確保したブロックを sig `'b'` で渡すと、C関数がそのブロックに
+値を書き込む「出力引数」パターンを安全に扱える。
+
+```myon
+module myon.ffi
+
+handle, err = myon.ffi.load(str("libsqlite3.so.0"))
+# sqlite3 *db を受け取る8バイト領域（x86-64のポインタは8バイト）
+outblock, aerr = myon.ffi.alloc(8)
+
+# int sqlite3_open(const char *filename, sqlite3 **ppDb)
+# sig "sb": 文字列引数 + バッファ（ブロックID）引数
+rc, oerr = myon.ffi.call_i(handle, str("sqlite3_open"),
+                           str("sb"), str(":memory:"), outblock)
+# rc == 0 (SQLITE_OK) を期待。書き込まれた db ハンドル値の読み出しには
+# バイト列読み出し機能（Phase3.1 Step4）が必要。
+
+freed, ferr = myon.ffi.free(outblock)
+ok, clerr = myon.ffi.close(handle)
+```
 
 ---
 

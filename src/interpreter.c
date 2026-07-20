@@ -557,9 +557,10 @@ static FFIState *ffi_get_state(Interp *it) {
 
 /* Convert one already-evaluated Myon Value into an FFIArgValue according to the
  * signature character `sig`.  Returns 1 on success, 0 on a type mismatch (and
- * writes a heap error message into *err). */
-static int ffi_convert_arg(char sig, const Value *v, FFIArgValue *av,
-                           FFIArgKind *ak, char **err) {
+ * writes a heap error message into *err).  `st` is used to resolve 'b'
+ * (memory-block) arguments to their real address. */
+static int ffi_convert_arg(FFIState *st, char sig, const Value *v,
+                           FFIArgValue *av, FFIArgKind *ak, char **err) {
     switch (sig) {
         case 'i':
             if (v->type == TYPE_INT)  { av->i = v->as.i; }
@@ -573,6 +574,17 @@ static int ffi_convert_arg(char sig, const Value *v, FFIArgValue *av,
             else { *err = myon_strdup("ffi: 'p' argument expects int (pointer handle)"); return 0; }
             *ak = FFI_ARG_PTR;
             return 1;
+        case 'b': {
+            /* Phase3.1: 'b' takes a Myon.ffi.alloc block ID and passes the
+             * block's real memory address to the C function (as a pointer).
+             * Guards against invalid IDs so a bogus value can never crash. */
+            if (v->type != TYPE_INT) { *err = myon_strdup("ffi: 'b' argument expects int (block id)"); return 0; }
+            void *p = ffi_mem_ptr(st, v->as.i);
+            if (!p) { *err = myon_strdup("ffi: 'b' argument is not a valid memory block id"); return 0; }
+            av->p = p;
+            *ak = FFI_ARG_PTR;
+            return 1;
+        }
         case 'd':
             if (v->type == TYPE_FLOAT) { av->d = v->as.f; }
             else if (v->type == TYPE_INT) { av->d = (double)v->as.i; }
@@ -658,7 +670,7 @@ static Value ffi_do_call(Interp *it, Env *env, Expr *call, FFIRetKind ret_kind) 
     for (int i = 0; i < nsig; i++) {
         Value av = eval_arg(it, env, call, 3 + i);
         argvals[nargvals++] = av;
-        if (!ffi_convert_arg(sig[i], &av, &args[i], &kinds[i], &cerr)) {
+        if (!ffi_convert_arg(ffi_get_state(it), sig[i], &av, &args[i], &kinds[i], &cerr)) {
             ok = 0;
             break;
         }
@@ -746,6 +758,78 @@ static int call_ffi(Interp *it, Env *env, const char *name, Expr *call, Value *o
     if (strcmp(name, "myon.ffi.call_d") == 0) { *out = ffi_do_call(it, env, call, FFI_RET_F64);  return 1; }
     if (strcmp(name, "myon.ffi.call_p") == 0) { *out = ffi_do_call(it, env, call, FFI_RET_PTR);  return 1; }
     if (strcmp(name, "myon.ffi.call_v") == 0) { *out = ffi_do_call(it, env, call, FFI_RET_VOID); return 1; }
+
+    /* myon.ffi.alloc(size) ret int, error  (Phase3.1) */
+    if (strcmp(name, "myon.ffi.alloc") == 0) {
+        Value sv = eval_arg(it, env, call, 0);
+        if (sv.type != TYPE_INT) { value_free(&sv); runtime_error(it, line, "myon.ffi.alloc expects an int size"); }
+        long long size = sv.as.i;
+        value_free(&sv);
+        if (size <= 0) {
+            *out = make_result_pair(value_int(-1),
+                value_error(myon_strdup("ffi.alloc: size must be positive")));
+            return 1;
+        }
+        long long id = ffi_mem_alloc(ffi_get_state(it), size);
+        if (id < 0) {
+            *out = make_result_pair(value_int(-1),
+                value_error(myon_strdup("ffi.alloc: out of memory")));
+        } else {
+            *out = make_result_pair(value_int(id), value_nil());
+        }
+        return 1;
+    }
+
+    /* myon.ffi.free(block_id) ret bool, error  (Phase3.1) */
+    if (strcmp(name, "myon.ffi.free") == 0) {
+        Value bv = eval_arg(it, env, call, 0);
+        if (bv.type != TYPE_INT) { value_free(&bv); runtime_error(it, line, "myon.ffi.free expects an int block id"); }
+        int ok = ffi_mem_free(ffi_get_state(it), bv.as.i);
+        value_free(&bv);
+        if (!ok) {
+            *out = make_result_pair(value_bool(0),
+                value_error(myon_strdup("ffi.free: invalid or already-freed block id")));
+        } else {
+            *out = make_result_pair(value_bool(1), value_nil());
+        }
+        return 1;
+    }
+
+    /* myon.ffi.read_cstr(addr, max_len) ret str, error  (Phase3.1) */
+    if (strcmp(name, "myon.ffi.read_cstr") == 0) {
+        Value av = eval_arg(it, env, call, 0);
+        Value mv = eval_arg(it, env, call, 1);
+        if (av.type != TYPE_INT || mv.type != TYPE_INT) {
+            value_free(&av); value_free(&mv);
+            *out = make_result_pair(value_str(myon_strdup("")),
+                value_error(myon_strdup("ffi.read_cstr expects (int addr, int max_len)")));
+            return 1;
+        }
+        long long addr = av.as.i;
+        long long max_len = mv.as.i;
+        value_free(&av); value_free(&mv);
+
+        /* upper bound on max_len to avoid runaway reads (16 MB) */
+        const long long FFI_READ_CSTR_LIMIT = 16LL * 1024 * 1024;
+        if (max_len <= 0 || max_len > FFI_READ_CSTR_LIMIT) {
+            *out = make_result_pair(value_str(myon_strdup("")),
+                value_error(myon_strdup("ffi.read_cstr: max_len must be in 1..16777216")));
+            return 1;
+        }
+        if (addr == 0) {
+            *out = make_result_pair(value_str(myon_strdup("")),
+                value_error(myon_strdup("ffi.read_cstr: NULL address")));
+            return 1;
+        }
+        char *s = ffi_read_cstring(addr, max_len);
+        if (!s) {
+            *out = make_result_pair(value_str(myon_strdup("")),
+                value_error(myon_strdup("ffi.read_cstr: could not read string")));
+        } else {
+            *out = make_result_pair(value_str(s), value_nil());
+        }
+        return 1;
+    }
 
     return 0;
 }
