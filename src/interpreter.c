@@ -21,6 +21,9 @@
 #include "lexer.h"
 #include "parser.h"
 #include "diag.h"
+#include "ffi.h"
+#include "ffi_call.h"
+#include "ffi_platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,6 +67,8 @@ struct Interp {
     /* retained parsed programs (REPL keeps ASTs alive across inputs) */
     Program    **programs;
     int          program_count;
+    /* Phase3 C FFI subsystem (lazily created on first myon.ffi.* use) */
+    FFIState    *ffi;
 };
 typedef struct Interp Interp;
 
@@ -536,6 +541,215 @@ static int call_file_io(Interp *it, Env *env, const char *name, Expr *call, Valu
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Standard library: myon.ffi.* (Phase3 — C FFI)                       */
+/*                                                                     */
+/* Like myon.file.*, failures surface as an `error(...)` value in the  */
+/* second tuple slot rather than aborting with a runtime_error, so the */
+/* caller can inspect them via `myon.if err != myon.nil` (spec 6.2).   */
+/* ------------------------------------------------------------------ */
+
+/* Lazily create (once) the interpreter's FFI subsystem. */
+static FFIState *ffi_get_state(Interp *it) {
+    if (!it->ffi) it->ffi = ffi_state_create();
+    return it->ffi;
+}
+
+/* Convert one already-evaluated Myon Value into an FFIArgValue according to the
+ * signature character `sig`.  Returns 1 on success, 0 on a type mismatch (and
+ * writes a heap error message into *err). */
+static int ffi_convert_arg(char sig, const Value *v, FFIArgValue *av,
+                           FFIArgKind *ak, char **err) {
+    switch (sig) {
+        case 'i':
+            if (v->type == TYPE_INT)  { av->i = v->as.i; }
+            else if (v->type == TYPE_BOOL) { av->i = v->as.b; }
+            else { *err = myon_strdup("ffi: 'i' argument expects int/bool"); return 0; }
+            *ak = FFI_ARG_I64;
+            return 1;
+        case 'p':
+            /* pointer handles are carried as Myon int */
+            if (v->type == TYPE_INT) { av->p = (void *)(size_t)v->as.i; }
+            else { *err = myon_strdup("ffi: 'p' argument expects int (pointer handle)"); return 0; }
+            *ak = FFI_ARG_PTR;
+            return 1;
+        case 'd':
+            if (v->type == TYPE_FLOAT) { av->d = v->as.f; }
+            else if (v->type == TYPE_INT) { av->d = (double)v->as.i; }
+            else { *err = myon_strdup("ffi: 'd' argument expects float/int"); return 0; }
+            *ak = FFI_ARG_F64;
+            return 1;
+        case 's':
+            if (v->type == TYPE_STR) { av->s = v->as.obj->as.str; }
+            else { *err = myon_strdup("ffi: 's' argument expects str"); return 0; }
+            *ak = FFI_ARG_STR;
+            return 1;
+        default: {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "ffi: unknown signature char '%c'", sig);
+            *err = myon_strdup(buf);
+            return 0;
+        }
+    }
+}
+
+/* Shared implementation for myon.ffi.call_{i,d,p,v}. */
+static Value ffi_do_call(Interp *it, Env *env, Expr *call, FFIRetKind ret_kind) {
+    int argc = call->as.call.arg_count;
+
+    Value fail_default = (ret_kind == FFI_RET_F64) ? value_float(0.0)
+                       : (ret_kind == FFI_RET_VOID) ? value_bool(0)
+                       : value_int(0);
+
+    if (argc < 3) {
+        return make_result_pair(fail_default,
+            value_error(myon_strdup("ffi.call_* expects (handle, name, sig, ...)")));
+    }
+
+    Value hv   = eval_arg(it, env, call, 0);
+    Value name = eval_arg(it, env, call, 1);
+    Value sigv = eval_arg(it, env, call, 2);
+
+    if (hv.type != TYPE_INT || name.type != TYPE_STR || sigv.type != TYPE_STR) {
+        value_free(&hv); value_free(&name); value_free(&sigv);
+        return make_result_pair(fail_default,
+            value_error(myon_strdup("ffi.call_* expects (int handle, str name, str sig)")));
+    }
+
+    long long handle = hv.as.i;
+    const char *sym  = name.as.obj->as.str;
+    const char *sig  = sigv.as.obj->as.str;
+    int nsig = (int)strlen(sig);
+
+    /* number of provided variadic args must match sig length */
+    int provided = argc - 3;
+    if (nsig != provided) {
+        value_free(&hv); value_free(&name); value_free(&sigv);
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "ffi.call_*: signature has %d args but %d were provided",
+                 nsig, provided);
+        return make_result_pair(fail_default, value_error(myon_strdup(buf)));
+    }
+    if (nsig > 6) {
+        value_free(&hv); value_free(&name); value_free(&sigv);
+        return make_result_pair(fail_default,
+            value_error(myon_strdup("ffi.call_*: at most 6 arguments are supported")));
+    }
+
+    /* resolve the symbol */
+    void *fn = ffi_lookup_symbol(ffi_get_state(it), handle, sym);
+    if (!fn) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "ffi.call_*: symbol '%s' not found in handle %lld",
+                 sym, handle);
+        value_free(&hv); value_free(&name); value_free(&sigv);
+        return make_result_pair(fail_default, value_error(myon_strdup(buf)));
+    }
+
+    /* evaluate and convert the variadic arguments in signature order */
+    FFIArgValue args[6];
+    FFIArgKind  kinds[6];
+    Value       argvals[6];
+    int         nargvals = 0;
+    char       *cerr = NULL;
+    int         ok = 1;
+
+    for (int i = 0; i < nsig; i++) {
+        Value av = eval_arg(it, env, call, 3 + i);
+        argvals[nargvals++] = av;
+        if (!ffi_convert_arg(sig[i], &av, &args[i], &kinds[i], &cerr)) {
+            ok = 0;
+            break;
+        }
+    }
+
+    Value result;
+    if (!ok) {
+        result = make_result_pair(fail_default, value_error(cerr));
+    } else {
+        FFIRetValue rv;
+        if (!ffi_call_dispatch(fn, args, kinds, nsig, ret_kind, &rv)) {
+            value_free(&fail_default);
+            result = make_result_pair(
+                (ret_kind == FFI_RET_F64) ? value_float(0.0)
+                : (ret_kind == FFI_RET_VOID) ? value_bool(0)
+                : value_int(0),
+                value_error(myon_strdup(
+                    "ffi.call_*: unsupported argument arity/ordering "
+                    "(integer-class args must precede double args; max 6)")));
+        } else {
+            value_free(&fail_default);
+            Value ok_val;
+            switch (ret_kind) {
+                case FFI_RET_F64:  ok_val = value_float(rv.d); break;
+                case FFI_RET_PTR:  ok_val = value_int((long long)(size_t)rv.p); break;
+                case FFI_RET_VOID: ok_val = value_bool(1); break;
+                case FFI_RET_I64:
+                default:           ok_val = value_int(rv.i); break;
+            }
+            result = make_result_pair(ok_val, value_nil());
+        }
+    }
+
+    for (int i = 0; i < nargvals; i++) value_free(&argvals[i]);
+    value_free(&hv); value_free(&name); value_free(&sigv);
+    return result;
+}
+
+/* Dispatch a "myon.ffi.<fn>" call. Returns 1 and sets *out if handled. */
+static int call_ffi(Interp *it, Env *env, const char *name, Expr *call, Value *out) {
+    int line = call->line;
+
+    /* myon.ffi.load(path) ret int, error */
+    if (strcmp(name, "myon.ffi.load") == 0) {
+        Value p = eval_arg(it, env, call, 0);
+        if (p.type != TYPE_STR) { value_free(&p); runtime_error(it, line, "myon.ffi.load expects a str path"); }
+        if (!ffi_platform_supported()) {
+            value_free(&p);
+            *out = make_result_pair(value_int(-1),
+                value_error(myon_strdup("FFI is not supported on this platform yet (Phase3 stub)")));
+            return 1;
+        }
+        const char *path = p.as.obj->as.str;
+        char *err = NULL;
+        long long h = ffi_load(ffi_get_state(it), path, &err);
+        if (h < 0) {
+            char buf[512];
+            snprintf(buf, sizeof(buf), "ffi.load: %s", err ? err : "load failed");
+            free(err);
+            value_free(&p);
+            *out = make_result_pair(value_int(-1), value_error(myon_strdup(buf)));
+            return 1;
+        }
+        value_free(&p);
+        *out = make_result_pair(value_int(h), value_nil());
+        return 1;
+    }
+
+    /* myon.ffi.close(handle) ret bool, error */
+    if (strcmp(name, "myon.ffi.close") == 0) {
+        Value hv = eval_arg(it, env, call, 0);
+        if (hv.type != TYPE_INT) { value_free(&hv); runtime_error(it, line, "myon.ffi.close expects an int handle"); }
+        int ok = ffi_close(ffi_get_state(it), hv.as.i);
+        value_free(&hv);
+        if (!ok) {
+            *out = make_result_pair(value_bool(0),
+                value_error(myon_strdup("ffi.close: invalid or already-closed handle")));
+        } else {
+            *out = make_result_pair(value_bool(1), value_nil());
+        }
+        return 1;
+    }
+
+    if (strcmp(name, "myon.ffi.call_i") == 0) { *out = ffi_do_call(it, env, call, FFI_RET_I64);  return 1; }
+    if (strcmp(name, "myon.ffi.call_d") == 0) { *out = ffi_do_call(it, env, call, FFI_RET_F64);  return 1; }
+    if (strcmp(name, "myon.ffi.call_p") == 0) { *out = ffi_do_call(it, env, call, FFI_RET_PTR);  return 1; }
+    if (strcmp(name, "myon.ffi.call_v") == 0) { *out = ffi_do_call(it, env, call, FFI_RET_VOID); return 1; }
+
+    return 0;
+}
+
 /* dispatch a "myon.math.<fn>" or "myon.string.<fn>" call.
  * Returns 1 and sets *out if handled. */
 static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value *out) {
@@ -545,6 +759,11 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
     /* ---- myon.file (file I/O, P4) ---- */
     if (strncmp(name, "myon.file.", 10) == 0) {
         if (call_file_io(it, env, name, call, out)) return 1;
+    }
+
+    /* ---- myon.ffi (C FFI, Phase3) ---- */
+    if (strncmp(name, "myon.ffi.", 9) == 0) {
+        if (call_ffi(it, env, name, call, out)) return 1;
     }
 
     /* ---- myon.math ---- */
@@ -1440,7 +1659,7 @@ static Flow exec_block(Interp *it, Env *env, StmtList *body) {
 /* ------------------------------------------------------------------ */
 
 static const char *BUILTIN_MODULES[] = {
-    "myon.stdio", "myon.math", "myon.string", NULL
+    "myon.stdio", "myon.math", "myon.string", "myon.ffi", NULL
 };
 
 static int is_builtin_module(const char *path) {
@@ -1600,6 +1819,7 @@ void interp_free(Interp *it) {
     if (!it) return;
     env_free(it->global);
     free(it->structs.items);
+    if (it->ffi) ffi_state_free(it->ffi);
     ModuleEntry *m = it->modules;
     while (m) { ModuleEntry *n = m->next; free(m->path); free(m->alias); free(m); m = n; }
     /* free retained program ASTs (structs/functions may reference their nodes,
@@ -1669,6 +1889,7 @@ int interpret(Program *program) {
 
     env_free(it.global);
     free(it.structs.items);
+    if (it.ffi) ffi_state_free(it.ffi);
     ModuleEntry *m = it.modules;
     while (m) { ModuleEntry *n = m->next; free(m->path); free(m->alias); free(m); m = n; }
     /* NOTE: for the one-shot path the caller (main.c) owns and frees `program`;

@@ -1,0 +1,19 @@
+# Verifies the FFI handle lifecycle: load -> close -> re-access.
+# A successful close returns true; closing an already-closed handle (or
+# calling into it) must surface an error value rather than crashing.
+module myon.ffi
+
+handle, err = myon.ffi.load(str("libm.so.6"))
+myon.if err != myon.nil then { myon.print(str("LOAD_FAIL")) } myon.else { myon.print(str("loaded")) }
+
+ok1, e1 = myon.ffi.close(handle)
+myon.print(ok1)
+
+# Re-closing an already-closed handle reports false + an error value.
+ok2, e2 = myon.ffi.close(handle)
+myon.print(ok2)
+myon.if e2 != myon.nil then { myon.print(str("reclose_err")) } myon.else { myon.print(str("reclose_ok")) }
+
+# Calling into a closed handle must also surface an error value.
+r, ce = myon.ffi.call_d(handle, str("sqrt"), str("d"), 16.0)
+myon.if ce != myon.nil then { myon.print(str("call_err")) } myon.else { myon.print(r) }

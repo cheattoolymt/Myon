@@ -1,0 +1,18 @@
+# Loading a shared library that does not exist must surface an error value
+# (spec 6.2) and return the invalid sentinel handle (-1).
+# When the load fails as expected we deliberately trigger a runtime error so
+# this case is verified via its non-zero exit (.err fixture). If the bogus
+# library somehow "loads", we exit normally, which fails the .err expectation.
+module myon.ffi
+
+handle, err = myon.ffi.load(str("/nonexistent/path/libdoesnotexist.so"))
+
+myon.if err != myon.nil then {
+    # Expected path: force an out-of-bounds access to abort with a non-zero exit.
+    empty = myon.array(int)
+    boom = empty[0]
+    myon.print(boom)
+} myon.else {
+    # Unexpected: the bogus library "loaded"; leave a marker and exit normally.
+    myon.print(str("UNEXPECTED_LOAD_OK"))
+}

@@ -434,6 +434,90 @@ myon.print(myon.file.exists("/tmp/does_not_exist.txt"))  // false
 
 ---
 
+### 10.3 C FFI（外部共有ライブラリ呼び出し, Phase3）
+
+`module myon.ffi` を宣言すると、ビルド済みの共有ライブラリ
+（Linux: `.so` / macOS: `.dylib` / Windows: `.dll`）に含まれるC関数を
+実行時に読み込んで直接呼び出せる。内部的には `dlopen`/`dlsym`/`dlclose`
+相当の仕組みを使う（`libffi` などの外部依存は持たない）。
+
+失敗（ライブラリ不在・シンボル未検出・型不一致など）は 6.2 節の
+エラー処理方式に従い、第2戻り値として `error` 値を返す。
+
+| 関数 | シグネチャ | 説明 |
+|------|-----------|------|
+| `myon.ffi.load`   | `myon.ffi.load(path: str) ret int, error`             | 共有ライブラリを読み込み、ハンドルID（`int`）を返す |
+| `myon.ffi.close`  | `myon.ffi.close(handle: int) ret bool, error`         | ハンドルを閉じる（成功時 `true`） |
+| `myon.ffi.call_i` | `myon.ffi.call_i(handle: int, name: str, sig: str, ...) ret int, error`   | `int` を返すC関数を呼ぶ |
+| `myon.ffi.call_d` | `myon.ffi.call_d(handle: int, name: str, sig: str, ...) ret float, error` | `double` を返すC関数を呼ぶ |
+| `myon.ffi.call_p` | `myon.ffi.call_p(handle: int, name: str, sig: str, ...) ret int, error`   | ポインタを返すC関数を呼ぶ（戻り値は `int` として表現） |
+| `myon.ffi.call_v` | `myon.ffi.call_v(handle: int, name: str, sig: str, ...) ret bool, error`  | `void`（戻り値なし）のC関数を呼ぶ（成功時 `true`） |
+
+**シグネチャ文字列（`sig`）の記法**
+
+引数の型を1文字ずつ並べた文字列で指定する。
+
+| 文字 | 対応するC型 | Myon側の型 |
+|------|-------------|-----------|
+| `i`  | `long long`（整数）  | `int` / `bool` |
+| `d`  | `double`             | `float`（`int` も可、自動的に `double` へ変換） |
+| `p`  | `void*`（不透明ポインタ） | `int`（ポインタ値をそのまま整数として保持） |
+| `s`  | `const char*`        | `str` |
+
+例: `"id"` は「`int` 引数を1つ、`double` 引数を1つ」の意味。
+戻り値の型は関数名で分ける（`call_i` / `call_d` / `call_p` / `call_v`）。
+引数は0〜6個までサポートする。`sig` が空文字列（`str("")`）の場合は
+引数0個（可変長引数を一切渡さない）を意味する。
+
+**対応する値の型と制約**
+
+- 対応する値の型は `int64` / `double` / `ptr` / `string` の4種類のみ。
+  構造体を値渡し・値返しする関数は本フェーズでは非対応。
+- ポインタを介した受け渡しはサポートするが、呼び出し先が構造体の中身を
+  書き込んで返す関数（例: `SDL_PollEvent(SDL_Event *event)`）は、その
+  構造体メモリをMyon側で `ptr` として確保できないため扱えない。
+  そのため本フェーズのFFIだけでは、ウィンドウを出して一定時間後に閉じる
+  程度のデモは組めるが、`SDL_PollEvent` を使う一般的なイベントループ形式の
+  GUIアプリは組めない。
+- 引数の並びは「整数系（`i`/`p`/`s`）の引数がすべて先、`double`（`d`）の
+  引数がすべて後」の順序のみサポートする（x86-64 System V ABI の
+  レジスタ割り当てに対応。SDL2 の主要関数はこの並びに収まる）。
+  それ以外の並び順や7引数以上は `error` を返す。
+- **32bit幅のC引数への注意**: Myonの `int` は64bit だが、呼び出し先の
+  C関数の引数が `int` / `unsigned int` / `Uint32` のような32bit幅である
+  場合がある。呼ばれた側が下位32bitのみを参照するため、`0 〜 4294967295`
+  の範囲で値を渡す限り問題は起きない。この範囲を超える値や負の値を渡すと
+  C関数が意図しない値を受け取る可能性があるため、呼び出し側が正しい範囲の
+  値を渡す責任を持つ（本フェーズでは自動的な範囲チェックは行わない）。
+
+**対応プラットフォーム**
+
+本フェーズの本命は Linux。macOS / Windows では `myon.ffi.load` を呼んだ
+時点で「FFI is not supported on this platform yet (Phase3 stub)」という
+`error` を返す（コンパイル自体は3OSとも通る）。
+
+```myon
+module myon.ffi
+
+handle, err = myon.ffi.load(str("libm.so.6"))
+myon.if err != myon.nil then { myon.print(str("load failed")) }
+
+// sqrt(16.0) -> 4.0
+result, cerr = myon.ffi.call_d(handle, str("sqrt"), str("d"), 16.0)
+myon.print(result)                                 // 4
+
+// pow(2.0, 10.0) -> 1024.0
+p, perr = myon.ffi.call_d(handle, str("pow"), str("dd"), 2.0, 10.0)
+myon.print(p)                                      // 1024
+
+ok, clerr = myon.ffi.close(handle)
+```
+
+- 一度 `close` したハンドルIDは再利用されない。閉じ済みハンドルへの
+  再アクセス（再 `close` や `call_*`）は `error` を返す。
+
+---
+
 ## 11. モジュールシステム
 
 ```myon

@@ -1,0 +1,48 @@
+# Phase3 C FFI demo: open an SDL2 window, wait, then close it.
+#
+# This is a NON-INTERACTIVE demo.  Because Phase3 FFI only supports
+# int/double/ptr/string arguments (no struct-by-pointer output such as
+# SDL_Event*), a real event loop with SDL_PollEvent cannot be written yet.
+# This sample just shows a window for ~2 seconds and quits.
+#
+# Requires SDL2 to be installed (e.g. libSDL2-2.0.so.0).  It is intentionally
+# NOT part of the regression tests (tests/cases/) because CI has no display.
+#
+# Run with:  ./myon examples/ffi_sdl_window.myon
+
+module myon.ffi
+
+# SDL constants
+# SDL_INIT_VIDEO           = 0x00000020 = 32
+# SDL_WINDOWPOS_UNDEFINED  = 0x1FFF0000 = 536805376
+# SDL_WINDOW_SHOWN         = 0x00000004 = 4
+
+handle, err = myon.ffi.load(str("libSDL2-2.0.so.0"))
+myon.if err != myon.nil then {
+    myon.print(str("SDL2 not available; skipping demo"))
+} myon.else {
+    # SDL_Init(Uint32 flags) -> int      signature "i"
+    rc, e1 = myon.ffi.call_i(handle, str("SDL_Init"), str("i"), 32)
+    myon.print(str("SDL_Init returned:"))
+    myon.print(rc)
+
+    # SDL_CreateWindow(const char* title, int x, int y, int w, int h,
+    #                  Uint32 flags) -> SDL_Window*   signature "siiiii"
+    # Returns a pointer, carried as an int handle via call_p.
+    win, e2 = myon.ffi.call_p(handle, str("SDL_CreateWindow"),
+                              str("siiiii"),
+                              str("Myon FFI"), 536805376, 536805376,
+                              640, 480, 4)
+
+    # SDL_Delay(Uint32 ms) -> void       signature "i"
+    ok, e3 = myon.ffi.call_v(handle, str("SDL_Delay"), str("i"), 2000)
+
+    # SDL_DestroyWindow(SDL_Window* w) -> void   signature "p"
+    ok2, e4 = myon.ffi.call_v(handle, str("SDL_DestroyWindow"), str("p"), win)
+
+    # SDL_Quit() -> void                 signature ""  (no arguments)
+    ok3, e5 = myon.ffi.call_v(handle, str("SDL_Quit"), str(""))
+
+    myon.ffi.close(handle)
+    myon.print(str("done"))
+}

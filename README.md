@@ -6,7 +6,7 @@
 
 ## 実装状況
 
-`make test` により、下表の各ステップ・項目に対応する回帰テスト（計 27 ケース）がすべてパスします。
+`make test` により、下表の各ステップ・項目に対応する回帰テスト（計 30 ケース）がすべてパスします。
 
 ### Step 0〜18（コア実装）
 
@@ -47,6 +47,25 @@
 P1・P3・P4・P5 には対応するテストケース（`tests/cases/p1_multiline_args`,
 `tests/cases/p4_file_io`, `tests/cases/p5_error_detail` ほか）を追加しています。
 P2・P6・P7 は仕様書（`docs/myon_spec.md`）の更新で完了です。
+
+### Phase 3（C FFI — 外部共有ライブラリ呼び出し）
+
+| ステップ | 内容 | 状態 |
+|---|---|---|
+| Step 1 | プラットフォーム抽象化層（`dlopen`/`dlsym`/`dlclose` ラップ、`src/ffi_platform.{h,c}`） | ✅ 実装 |
+| Step 2 | FFI 型・ハンドル管理レイヤ（`src/ffi.{h,c}`） | ✅ 実装 |
+| Step 3 | 呼び出しテーブル（libffi 不使用、引数パターン別 C ラッパー、`src/ffi_call.{h,c}`） | ✅ 実装 |
+| Step 4 | Myon 言語結合（`module myon.ffi`：`load`/`close`/`call_i`/`call_d`/`call_p`/`call_v`） | ✅ 実装 |
+| Step 5 | 回帰テスト・ドキュメント仕上げ | ✅ 実装 |
+
+`module myon.ffi` を宣言すると、ビルド済みの共有ライブラリ（Linux の `.so` など）に
+含まれる C 関数を実行時に呼び出せます。対応する値の型は `int` / `float` / ポインタ（`int`
+として表現）/ `str` の4種類で、構造体の値渡し・値返しは対象外です。対応 OS は Linux
+（macOS / Windows は `myon.ffi.load` 時に「未対応」の `error` を返すスタブ）。詳細と制約は
+仕様書 [`docs/myon_spec.md`](docs/myon_spec.md) の「10.3 C FFI」節を参照してください。
+テストは環境非依存の `libm`（数学ライブラリ）を用います（`tests/cases/p_ffi_basic`,
+`tests/cases/p_ffi_load_fail`, `tests/cases/p_ffi_close`）。SDL2 を使った非対話デモは
+`examples/ffi_sdl_window.myon` に置いてあります（回帰テストには含めません）。
 
 ## ビルド
 
@@ -118,6 +137,9 @@ src/
   interpreter.{h,c}  ツリーウォーク型インタプリタ（Step 4〜17・P4 ファイルI/O）
   common.{h,c}       共通ユーティリティ（メモリ確保・文字列複製）
   diag.{h,c}         診断ヘルパー（P5: ソース抜粋・列番号・トークン名変換）
+  ffi_platform.{h,c} C FFI プラットフォーム抽象化層（dlopen/dlsym, Phase3 Step1）
+  ffi.{h,c}          C FFI 型・ハンドル管理レイヤ（Phase3 Step2）
+  ffi_call.{h,c}     C FFI 呼び出しディスパッチ（libffi 不使用, Phase3 Step3）
   main.c             エントリポイント（ファイル実行 / REPL, P3）
 examples/            サンプルプログラム
 tests/               回帰テスト（`make test`）
