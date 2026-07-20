@@ -33,6 +33,7 @@
 #include <limits.h>
 #include <math.h>
 #include <ctype.h>
+#include <errno.h>
 
 /* Some C standard libraries only expose M_PI / M_E under _GNU_SOURCE or
  * similar feature-test macros; provide portable fallbacks (Phase3.5). */
@@ -479,6 +480,33 @@ static long long utf8_char_count(const char *s) {
         count++;
     }
     return count;
+}
+
+/* Return the byte offset at which code point `char_idx` (0-indexed) begins in
+ * the NUL-terminated UTF-8 string `s`.  When `char_idx` reaches or exceeds the
+ * number of code points, the byte length (offset of the NUL terminator) is
+ * returned, so callers can address the one-past-the-end position for slicing.
+ * Malformed sequences use the same robust fallback as utf8_char_count(). */
+static long long utf8_byte_offset(const char *s, long long char_idx) {
+    const unsigned char *base = (const unsigned char *)s;
+    const unsigned char *p = base;
+    long long seen = 0;
+    while (*p && seen < char_idx) {
+        unsigned char c = *p;
+        int extra;
+        if      ((c & 0x80) == 0x00) extra = 0; /* 0xxxxxxx */
+        else if ((c & 0xE0) == 0xC0) extra = 1; /* 110xxxxx */
+        else if ((c & 0xF0) == 0xE0) extra = 2; /* 1110xxxx */
+        else if ((c & 0xF8) == 0xF0) extra = 3; /* 11110xxx */
+        else { p++; seen++; continue; }         /* invalid lead byte */
+        p++;
+        for (int k = 0; k < extra && *p; k++) {
+            if ((*p & 0xC0) != 0x80) break;      /* invalid continuation */
+            p++;
+        }
+        seen++;
+    }
+    return (long long)(p - base);
 }
 
 /* Build a 2-value tuple (value, error) for the Rust/Go-style return
@@ -1226,6 +1254,287 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
         value_free(&a);
         *out = value_str(s); return 1;
     }
+
+    /* ---- myon.string (Phase3.5 extension, Step4) ----
+     * Index-based helpers operate on *character* (code-point) positions, not
+     * byte offsets, so they stay correct for multi-byte UTF-8 text. */
+
+    /* substring(s, start, len) ret str, error — character-based slice. */
+    if (strcmp(name, "myon.string.substring") == 0) {
+        Value s = eval_arg(it, env, call, 0);
+        Value vs = eval_arg(it, env, call, 1);
+        Value vl = eval_arg(it, env, call, 2);
+        if (s.type != TYPE_STR || vs.type != TYPE_INT || vl.type != TYPE_INT) {
+            value_free(&s); value_free(&vs); value_free(&vl);
+            runtime_error(it, line, "myon.string.substring expects (str, int, int)");
+        }
+        long long start = vs.as.i, len = vl.as.i;
+        const char *cs = s.as.obj->as.str;
+        long long nchars = utf8_char_count(cs);
+        if (start < 0 || len < 0 || start + len > nchars) {
+            *out = make_result_pair(value_str(myon_strdup("")),
+                value_error(myon_strdup("myon.string.substring: range out of bounds")));
+            value_free(&s); value_free(&vs); value_free(&vl); return 1;
+        }
+        long long boff = utf8_byte_offset(cs, start);
+        long long eoff = utf8_byte_offset(cs, start + len);
+        long long nbytes = eoff - boff;
+        char *buf = (char *)myon_xmalloc((size_t)nbytes + 1);
+        memcpy(buf, cs + boff, (size_t)nbytes);
+        buf[nbytes] = '\0';
+        *out = make_result_pair(value_str(buf), value_nil());
+        value_free(&s); value_free(&vs); value_free(&vl); return 1;
+    }
+
+    /* split(s, sep) ret myon.array(str). Empty sep splits into single chars. */
+    if (strcmp(name, "myon.string.split") == 0) {
+        Value s = eval_arg(it, env, call, 0), sep = eval_arg(it, env, call, 1);
+        if (s.type != TYPE_STR || sep.type != TYPE_STR) {
+            value_free(&s); value_free(&sep);
+            runtime_error(it, line, "myon.string.split expects two str values");
+        }
+        const char *cs = s.as.obj->as.str;
+        const char *csep = sep.as.obj->as.str;
+        Value arr = value_array(typespec_prim(TYPE_STR));
+        if (cs[0] == '\0') {
+            /* Empty input yields an empty array. */
+        } else if (csep[0] == '\0') {
+            /* Empty separator: one element per code point. */
+            const char *p = cs;
+            while (*p) {
+                long long adv = utf8_byte_offset(p, 1);
+                if (adv <= 0) adv = 1; /* defensive: always make progress */
+                char *piece = (char *)myon_xmalloc((size_t)adv + 1);
+                memcpy(piece, p, (size_t)adv);
+                piece[adv] = '\0';
+                array_push(&arr, value_str(piece));
+                p += adv;
+            }
+        } else {
+            size_t seplen = strlen(csep);
+            const char *p = cs;
+            const char *hit;
+            while ((hit = strstr(p, csep)) != NULL) {
+                size_t n = (size_t)(hit - p);
+                char *piece = (char *)myon_xmalloc(n + 1);
+                memcpy(piece, p, n);
+                piece[n] = '\0';
+                array_push(&arr, value_str(piece));
+                p = hit + seplen;
+            }
+            array_push(&arr, value_str(myon_strdup(p)));
+        }
+        value_free(&s); value_free(&sep);
+        *out = arr; return 1;
+    }
+
+    /* join(parts, sep) ret str. */
+    if (strcmp(name, "myon.string.join") == 0) {
+        Value parts = eval_arg(it, env, call, 0), sep = eval_arg(it, env, call, 1);
+        if (parts.type != TYPE_ARRAY || sep.type != TYPE_STR) {
+            value_free(&parts); value_free(&sep);
+            runtime_error(it, line, "myon.string.join expects (myon.array(str), str)");
+        }
+        const char *csep = sep.as.obj->as.str;
+        size_t seplen = strlen(csep);
+        ArrayData *a = &parts.as.obj->as.arr;
+        size_t total = 1;
+        for (int i = 0; i < a->count; i++) {
+            if (a->items[i].type != TYPE_STR) {
+                value_free(&parts); value_free(&sep);
+                runtime_error(it, line, "myon.string.join: array elements must be str");
+            }
+            total += strlen(a->items[i].as.obj->as.str);
+            if (i) total += seplen;
+        }
+        char *buf = (char *)myon_xmalloc(total);
+        buf[0] = '\0';
+        size_t off = 0;
+        for (int i = 0; i < a->count; i++) {
+            if (i) { memcpy(buf + off, csep, seplen); off += seplen; }
+            const char *piece = a->items[i].as.obj->as.str;
+            size_t plen = strlen(piece);
+            memcpy(buf + off, piece, plen); off += plen;
+        }
+        buf[off] = '\0';
+        value_free(&parts); value_free(&sep);
+        *out = value_str(buf); return 1;
+    }
+
+    /* trim(s) ret str — strip leading/trailing ASCII whitespace. */
+    if (strcmp(name, "myon.string.trim") == 0) {
+        Value s = eval_arg(it, env, call, 0);
+        if (s.type != TYPE_STR) { value_free(&s); runtime_error(it, line, "myon.string.trim expects str"); }
+        const char *cs = s.as.obj->as.str;
+        const char *b = cs;
+        while (*b && isspace((unsigned char)*b)) b++;
+        const char *e = cs + strlen(cs);
+        while (e > b && isspace((unsigned char)e[-1])) e--;
+        size_t n = (size_t)(e - b);
+        char *buf = (char *)myon_xmalloc(n + 1);
+        memcpy(buf, b, n); buf[n] = '\0';
+        value_free(&s);
+        *out = value_str(buf); return 1;
+    }
+
+    /* replace(s, from, to) ret str — replace every occurrence. */
+    if (strcmp(name, "myon.string.replace") == 0) {
+        Value s = eval_arg(it, env, call, 0);
+        Value from = eval_arg(it, env, call, 1);
+        Value to = eval_arg(it, env, call, 2);
+        if (s.type != TYPE_STR || from.type != TYPE_STR || to.type != TYPE_STR) {
+            value_free(&s); value_free(&from); value_free(&to);
+            runtime_error(it, line, "myon.string.replace expects three str values");
+        }
+        const char *cs = s.as.obj->as.str;
+        const char *cf = from.as.obj->as.str;
+        const char *ct = to.as.obj->as.str;
+        if (cf[0] == '\0') {
+            /* Empty needle: return the input unchanged (avoid infinite loop). */
+            value_free(&from); value_free(&to);
+            *out = s; return 1;
+        }
+        size_t flen = strlen(cf), tlen = strlen(ct);
+        size_t cap = strlen(cs) + 1, len = 0;
+        char *buf = (char *)myon_xmalloc(cap);
+        const char *p = cs;
+        const char *hit;
+        while ((hit = strstr(p, cf)) != NULL) {
+            size_t chunk = (size_t)(hit - p);
+            while (len + chunk + tlen + 1 > cap) { cap *= 2; buf = (char *)myon_xrealloc(buf, cap); }
+            memcpy(buf + len, p, chunk); len += chunk;
+            memcpy(buf + len, ct, tlen); len += tlen;
+            p = hit + flen;
+        }
+        size_t rest = strlen(p);
+        while (len + rest + 1 > cap) { cap *= 2; buf = (char *)myon_xrealloc(buf, cap); }
+        memcpy(buf + len, p, rest); len += rest;
+        buf[len] = '\0';
+        value_free(&s); value_free(&from); value_free(&to);
+        *out = value_str(buf); return 1;
+    }
+
+    /* index_of(s, sub) ret int — character index of first match, or -1. */
+    if (strcmp(name, "myon.string.index_of") == 0) {
+        Value s = eval_arg(it, env, call, 0), sub = eval_arg(it, env, call, 1);
+        if (s.type != TYPE_STR || sub.type != TYPE_STR) {
+            value_free(&s); value_free(&sub);
+            runtime_error(it, line, "myon.string.index_of expects two str values");
+        }
+        const char *cs = s.as.obj->as.str;
+        const char *hit = strstr(cs, sub.as.obj->as.str);
+        long long idx;
+        if (!hit) {
+            idx = -1;
+        } else {
+            /* Convert the byte offset of the match to a character index. */
+            size_t boff = (size_t)(hit - cs);
+            char saved = cs[boff];
+            ((char *)cs)[boff] = '\0';
+            idx = utf8_char_count(cs);
+            ((char *)cs)[boff] = saved;
+        }
+        value_free(&s); value_free(&sub);
+        *out = value_int(idx); return 1;
+    }
+
+    /* starts_with / ends_with ret bool. */
+    if (strcmp(name, "myon.string.starts_with") == 0) {
+        Value s = eval_arg(it, env, call, 0), pre = eval_arg(it, env, call, 1);
+        if (s.type != TYPE_STR || pre.type != TYPE_STR) {
+            value_free(&s); value_free(&pre);
+            runtime_error(it, line, "myon.string.starts_with expects two str values");
+        }
+        const char *cs = s.as.obj->as.str;
+        const char *cp = pre.as.obj->as.str;
+        size_t plen = strlen(cp);
+        int r = strncmp(cs, cp, plen) == 0;
+        value_free(&s); value_free(&pre);
+        *out = value_bool(r); return 1;
+    }
+    if (strcmp(name, "myon.string.ends_with") == 0) {
+        Value s = eval_arg(it, env, call, 0), suf = eval_arg(it, env, call, 1);
+        if (s.type != TYPE_STR || suf.type != TYPE_STR) {
+            value_free(&s); value_free(&suf);
+            runtime_error(it, line, "myon.string.ends_with expects two str values");
+        }
+        const char *cs = s.as.obj->as.str;
+        const char *cx = suf.as.obj->as.str;
+        size_t slen = strlen(cs), xlen = strlen(cx);
+        int r = xlen <= slen && memcmp(cs + slen - xlen, cx, xlen) == 0;
+        value_free(&s); value_free(&suf);
+        *out = value_bool(r); return 1;
+    }
+
+    /* repeat(s, n) ret str, error — n<0 errors, n==0 yields "". */
+    if (strcmp(name, "myon.string.repeat") == 0) {
+        Value s = eval_arg(it, env, call, 0), vn = eval_arg(it, env, call, 1);
+        if (s.type != TYPE_STR || vn.type != TYPE_INT) {
+            value_free(&s); value_free(&vn);
+            runtime_error(it, line, "myon.string.repeat expects (str, int)");
+        }
+        long long n = vn.as.i;
+        if (n < 0) {
+            *out = make_result_pair(value_str(myon_strdup("")),
+                value_error(myon_strdup("myon.string.repeat: count must be non-negative")));
+            value_free(&s); value_free(&vn); return 1;
+        }
+        const char *cs = s.as.obj->as.str;
+        size_t unit = strlen(cs);
+        size_t total = unit * (size_t)n;
+        char *buf = (char *)myon_xmalloc(total + 1);
+        for (long long i = 0; i < n; i++) memcpy(buf + (size_t)i * unit, cs, unit);
+        buf[total] = '\0';
+        *out = make_result_pair(value_str(buf), value_nil());
+        value_free(&s); value_free(&vn); return 1;
+    }
+
+    /* to_int(s) ret int, error. */
+    if (strcmp(name, "myon.string.to_int") == 0) {
+        Value s = eval_arg(it, env, call, 0);
+        if (s.type != TYPE_STR) { value_free(&s); runtime_error(it, line, "myon.string.to_int expects str"); }
+        const char *cs = s.as.obj->as.str;
+        char *end = NULL;
+        errno = 0;
+        long long v = strtoll(cs, &end, 10);
+        if (cs[0] == '\0' || end == cs || *end != '\0') {
+            *out = make_result_pair(value_int(0),
+                value_error(myon_strdup("myon.string.to_int: not an integer")));
+        } else {
+            *out = make_result_pair(value_int(v), value_nil());
+        }
+        value_free(&s); return 1;
+    }
+
+    /* to_float(s) ret float, error. */
+    if (strcmp(name, "myon.string.to_float") == 0) {
+        Value s = eval_arg(it, env, call, 0);
+        if (s.type != TYPE_STR) { value_free(&s); runtime_error(it, line, "myon.string.to_float expects str"); }
+        const char *cs = s.as.obj->as.str;
+        char *end = NULL;
+        errno = 0;
+        double v = strtod(cs, &end);
+        if (cs[0] == '\0' || end == cs || *end != '\0') {
+            *out = make_result_pair(value_float(0.0),
+                value_error(myon_strdup("myon.string.to_float: not a number")));
+        } else {
+            *out = make_result_pair(value_float(v), value_nil());
+        }
+        value_free(&s); return 1;
+    }
+
+    /* from_int / from_float ret str — reuse value_to_cstr()'s rendering. */
+    if (strcmp(name, "myon.string.from_int") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        if (a.type != TYPE_INT) { value_free(&a); runtime_error(it, line, "myon.string.from_int expects int"); }
+        *out = value_str(value_to_cstr(&a)); value_free(&a); return 1;
+    }
+    if (strcmp(name, "myon.string.from_float") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        if (a.type != TYPE_FLOAT) { value_free(&a); runtime_error(it, line, "myon.string.from_float expects float"); }
+        *out = value_str(value_to_cstr(&a)); value_free(&a); return 1;
+    }
+
     (void)argc;
     return 0;
 }

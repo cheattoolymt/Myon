@@ -663,6 +663,101 @@ ok, clerr = myon.ffi.close(handle)
 
 ---
 
+### 10.4 標準ライブラリ myon.math / myon.string（Phase3.5）
+
+Step16で最小実装された `myon.math` / `myon.string` を、Phase3.5で実用的な
+ラインナップに拡張・修正した。ここで確定した関数シグネチャが正式な仕様である
+（14.4節・15章の「未確定」記述はこれをもって解消する）。
+
+#### 数値の型保持ルール
+
+`myon.math` の関数は、C言語などと同様の暗黙昇格ルールに従う。
+
+- **全ての数値引数が `int` 型であれば結果も `int` 型**（数学的に整数を
+  返しうる関数に限る）。
+- **1つでも `float` が含まれていれば結果は `float` 型**。
+
+「整数のままで意味が保たれる」関数（`abs` / `max` / `min` / `floor` /
+`ceil` / `round` / `trunc` / `mod` / `sign` / `clamp`）は `int` 入力で
+`int` を返し、`double` を経由しない。これにより `2^53` を超える `int64`
+値でも丸め誤差なく正確に扱える。一方 `sqrt` / `pow` / 三角関数 / 対数などは
+数学的に非整数を返しうるため、`int` 入力でも常に `float` を返す。
+
+#### myon.math 関数一覧
+
+| 関数 | シグネチャ | 説明 |
+|------|-----------|------|
+| `sqrt` | `(x: float) ret float` | 平方根（常にfloat） |
+| `pow` | `(a: float, b: float) ret float` | べき乗（常にfloat） |
+| `abs` | `(x: int\|float) ret int\|float` | 絶対値（型保持） |
+| `floor` | `(x: int\|float) ret int` | 床関数（常にint、int入力はそのまま） |
+| `ceil` | `(x: int\|float) ret int` | 天井関数（常にint、int入力はそのまま） |
+| `round` | `(x: int\|float) ret int` | 四捨五入（C標準`round()`、常にint） |
+| `trunc` | `(x: int\|float) ret int` | 0方向への切り捨て（常にint） |
+| `max` | `(a: int\|float, b: int\|float) ret int\|float` | 最大値（型保持） |
+| `min` | `(a: int\|float, b: int\|float) ret int\|float` | 最小値（型保持） |
+| `sin` `cos` `tan` | `(x: float) ret float` | 三角関数（ラジアン） |
+| `asin` `acos` `atan` | `(x: float) ret float` | 逆三角関数 |
+| `atan2` | `(y: float, x: float) ret float` | 2引数逆正接 |
+| `log` | `(x: float) ret float` | 自然対数 |
+| `log2` | `(x: float) ret float` | 底2の対数 |
+| `log10` | `(x: float) ret float` | 常用対数 |
+| `exp` | `(x: float) ret float` | 指数関数 |
+| `mod` | `(a: int\|float, b: int\|float) ret int\|float, error` | 剰余。ゼロ除算時は`error`を返す（型保持） |
+| `sign` | `(x: int\|float) ret int` | 符号（正=1 / 負=-1 / ゼロ=0、常にint） |
+| `clamp` | `(x, lo, hi: int\|float) ret int\|float` | lo以上hi以下にクランプ（3つ全てintならint演算） |
+| `pi` | `() ret float` | 円周率 π |
+| `e` | `() ret float` | ネイピア数 e |
+
+`mod` はゼロ除算をスクリプト側でハンドリングできるよう、他の `myon.math`
+関数と異なり `(value, error)` の2値返却にしている。
+
+```myon
+myon.print(myon.math.max(9223372036854775807, 1))  // 9223372036854775807（誤差なし）
+myon.print(myon.math.floor(3.7))                    // 3
+q, err = myon.math.mod(7, 0)                         // err != myon.nil（ゼロ除算）
+myon.print(myon.math.clamp(15, 0, 10))              // 10
+```
+
+#### myon.string 関数一覧
+
+`length` は **Unicodeコードポイント数（文字数）** を返す。バイト数が必要な
+場合は `byte_length` を使う。`substring` / `index_of` / `split`（空区切り）
+などのインデックス系関数は全て **文字数ベース** であり、バイトオフセット
+ではない（日本語などのマルチバイト文字でも安全）。
+
+| 関数 | シグネチャ | 説明 |
+|------|-----------|------|
+| `length` | `(s: str) ret int` | 文字数（Unicodeコードポイント数） |
+| `byte_length` | `(s: str) ret int` | バイト数（`strlen`相当） |
+| `concat` | `(a: str, b: str) ret str` | 連結 |
+| `contains` | `(s: str, sub: str) ret bool` | 部分文字列を含むか |
+| `upper` / `lower` | `(s: str) ret str` | 大文字化 / 小文字化（ASCII） |
+| `substring` | `(s: str, start: int, len: int) ret str, error` | start文字目からlen文字分（文字数ベース）。範囲外は`error` |
+| `split` | `(s: str, sep: str) ret myon.array(str)` | sep区切りで分割。空sepは1文字ずつ、空sは空配列 |
+| `join` | `(parts: myon.array(str), sep: str) ret str` | sepで連結。空配列は`""` |
+| `trim` | `(s: str) ret str` | 先頭・末尾のASCII空白を除去 |
+| `replace` | `(s: str, from: str, to: str) ret str` | fromを全てtoに置換。空fromはそのまま返す |
+| `index_of` | `(s: str, sub: str) ret int` | subの最初の出現位置（文字数、0-indexed）。無ければ`-1` |
+| `starts_with` | `(s: str, prefix: str) ret bool` | 接頭辞判定 |
+| `ends_with` | `(s: str, suffix: str) ret bool` | 接尾辞判定 |
+| `repeat` | `(s: str, n: int) ret str, error` | sをn回繰り返す。n<0は`error`、n=0は`""` |
+| `to_int` | `(s: str) ret int, error` | 整数へパース（`strtoll`）。失敗時は`error` |
+| `to_float` | `(s: str) ret float, error` | 浮動小数点数へパース（`strtod`）。失敗時は`error` |
+| `from_int` | `(n: int) ret str` | 整数を文字列化 |
+| `from_float` | `(f: float) ret str` | 浮動小数点数を文字列化 |
+
+```myon
+myon.print(myon.string.length(str("あ")))       // 1（文字数）
+myon.print(myon.string.byte_length(str("あ")))  // 3（バイト数）
+sub, err = myon.string.substring(str("こんにちは"), 1, 3)  // "んにち"（文字数ベース）
+myon.print(myon.string.index_of(str("こんにちは"), str("にち")))  // 2（文字数ベース）
+parts = myon.string.split(str("a,b,c"), str(","))          // ["a", "b", "c"]
+myon.print(myon.string.join(parts, str(",")))              // "a,b,c"
+```
+
+---
+
 ## 11. モジュールシステム
 
 ```myon
@@ -940,12 +1035,15 @@ result = myon.await fetchData()
 ## 15. Open Questions（残存する未決定事項）
 
 - `myon.map` のキー型に許される範囲（str/int以外の任意型を許すか）
-- 標準ライブラリ `myon.math`/`myon.string` の具体的な関数シグネチャ一覧
 - 型推論をリテラル以外の式（関数呼び出し結果等）にも広げるか
 
 > 以下は Phase 2 で確定済みのため本リストから除外した。
 > - `myon.async`/`myon.await` の実行モデル → 疑似非同期に確定（14.9節）
 > - ジェネリクスの型制約 → 導入しないことに確定（14.8節）
+>
+> 以下は Phase 3.5 で確定済みのため本リストから除外した。
+> - 標準ライブラリ `myon.math`/`myon.string` の具体的な関数シグネチャ一覧
+>   → 全関数のシグネチャを 10.4節 に確定
 
 ---
 

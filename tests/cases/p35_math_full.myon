@@ -1,0 +1,40 @@
+# Phase3.5 Step3: exercise the full myon.math extension set.
+module myon.stdio
+module myon.math
+
+# trig / inverse-trig (radians)
+myon.print(myon.math.round(myon.math.sin(0.0)))
+myon.print(myon.math.round(myon.math.cos(0.0)))
+myon.print(myon.math.round(myon.math.atan2(1.0, 1.0) * 4.0))
+
+# logs / exp
+myon.print(myon.math.round(myon.math.log(myon.math.e())))
+myon.print(myon.math.round(myon.math.log2(8.0)))
+myon.print(myon.math.round(myon.math.log10(1000.0)))
+myon.print(myon.math.round(myon.math.exp(0.0)))
+
+# round / trunc
+myon.print(myon.math.round(2.5))
+myon.print(myon.math.round(-2.5))
+myon.print(myon.math.trunc(3.9))
+myon.print(myon.math.trunc(-3.9))
+
+# mod (int keeps int; zero divisor returns an error)
+q1, e1 = myon.math.mod(7, 3)
+myon.print(q1)
+q2, e2 = myon.math.mod(7, 0)
+myon.if e2 != myon.nil then { myon.print(str("mod_zero_err")) } myon.else { myon.print(str("mod_zero_ok")) }
+
+# sign
+myon.print(myon.math.sign(-5))
+myon.print(myon.math.sign(0))
+myon.print(myon.math.sign(42))
+
+# clamp
+myon.print(myon.math.clamp(15, 0, 10))
+myon.print(myon.math.clamp(-3, 0, 10))
+myon.print(myon.math.clamp(5, 0, 10))
+
+# constants
+myon.print(myon.math.round(myon.math.pi()))
+myon.print(myon.math.round(myon.math.e()))
