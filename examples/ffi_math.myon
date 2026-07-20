@@ -1,0 +1,24 @@
+# Phase3 C FFI demo: call libm math functions directly from Myon.
+#
+# Run with:  ./myon examples/ffi_math.myon
+# (libm.so.6 ships with glibc on virtually every Linux system.)
+
+module myon.ffi
+
+handle, err = myon.ffi.load(str("libm.so.6"))
+myon.if err != myon.nil then {
+    myon.print(str("load failed"))
+} myon.else {
+    myon.print(str("loaded libm"))
+}
+
+# sqrt(16.0) -> 4.0   (signature "d": one double argument, returns double)
+result, cerr = myon.ffi.call_d(handle, str("sqrt"), str("d"), 16.0)
+myon.print(result)
+
+# pow(2.0, 10.0) -> 1024.0   (signature "dd": two double arguments)
+p, perr = myon.ffi.call_d(handle, str("pow"), str("dd"), 2.0, 10.0)
+myon.print(p)
+
+ok, clerr = myon.ffi.close(handle)
+myon.print(ok)

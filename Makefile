@@ -15,6 +15,13 @@
 CC      ?= cc
 CFLAGS  ?= -std=c11 -Wall -Wextra -Wpedantic -O2
 LDLIBS  ?= -lm
+
+# Phase3 C FFI needs the dynamic loader (dlopen/dlsym/dlclose) on Linux.
+# On macOS these live in libSystem (no extra flag); Windows uses its own API.
+UNAME_S := $(shell uname -s 2>/dev/null)
+ifeq ($(UNAME_S),Linux)
+LDLIBS  += -ldl
+endif
 SRC_DIR  = src
 BUILD    = build
 BIN      = myon

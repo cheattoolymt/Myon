@@ -1,0 +1,4 @@
+# Expect a non-zero exit: loading a non-existent shared library returns an
+# error value, and the test then deliberately triggers an out-of-bounds
+# runtime error to prove that branch was taken. The exact message text is
+# intentionally not pinned; only the non-zero exit is checked.

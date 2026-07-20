@@ -1,0 +1,13 @@
+module myon.ffi
+
+handle, err = myon.ffi.load(str("libm.so.6"))
+myon.if err != myon.nil then { myon.print(str("LOAD_FAIL")) } myon.else { myon.print(str("loaded")) }
+
+result, cerr = myon.ffi.call_d(handle, str("sqrt"), str("d"), 16.0)
+myon.print(result)
+
+p, perr = myon.ffi.call_d(handle, str("pow"), str("dd"), 2.0, 10.0)
+myon.print(p)
+
+ok, clerr = myon.ffi.close(handle)
+myon.print(ok)
