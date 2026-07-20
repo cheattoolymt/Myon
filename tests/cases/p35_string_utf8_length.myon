@@ -1,12 +1,13 @@
-# Phase3.5 Step2: length counts code points; byte_length counts bytes.
+# Phase3.5 Step2 (corrected): length counts bytes (unchanged, backward
+# compatible); length_chars counts Unicode code points.
 module myon.stdio
 module myon.string
 
 myon.print(myon.string.length(str("hello")))
-myon.print(myon.string.byte_length(str("hello")))
+myon.print(myon.string.length_chars(str("hello")))
 myon.print(myon.string.length(str("あいう")))
-myon.print(myon.string.byte_length(str("あいう")))
+myon.print(myon.string.length_chars(str("あいう")))
 myon.print(myon.string.length(str("こんにちは")))
-myon.print(myon.string.byte_length(str("こんにちは")))
+myon.print(myon.string.length_chars(str("こんにちは")))
 myon.print(myon.string.length(str("aあb")))
-myon.print(myon.string.byte_length(str("aあb")))
+myon.print(myon.string.length_chars(str("aあb")))
