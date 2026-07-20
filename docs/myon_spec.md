@@ -779,15 +779,16 @@ myon.print(myon.math.clamp(15, 0, 10))              // 10
 
 #### myon.string 関数一覧
 
-`length` は **Unicodeコードポイント数（文字数）** を返す。バイト数が必要な
-場合は `byte_length` を使う。`substring` / `index_of` / `split`（空区切り）
+`length` は **バイト数**（`strlen`相当、既存動作のまま）を返す。
+Unicodeコードポイント数（文字数）が必要な場合は `length_chars` を使う。
+`substring` / `index_of` / `split`（空区切り）
 などのインデックス系関数は全て **文字数ベース** であり、バイトオフセット
 ではない（日本語などのマルチバイト文字でも安全）。
 
 | 関数 | シグネチャ | 説明 |
 |------|-----------|------|
-| `length` | `(s: str) ret int` | 文字数（Unicodeコードポイント数） |
-| `byte_length` | `(s: str) ret int` | バイト数（`strlen`相当） |
+| `length` | `(s: str) ret int` | バイト数（`strlen`相当） |
+| `length_chars` | `(s: str) ret int` | 文字数（Unicodeコードポイント数） |
 | `concat` | `(a: str, b: str) ret str` | 連結 |
 | `contains` | `(s: str, sub: str) ret bool` | 部分文字列を含むか |
 | `upper` / `lower` | `(s: str) ret str` | 大文字化 / 小文字化（ASCII） |
@@ -806,8 +807,8 @@ myon.print(myon.math.clamp(15, 0, 10))              // 10
 | `from_float` | `(f: float) ret str` | 浮動小数点数を文字列化 |
 
 ```myon
-myon.print(myon.string.length(str("あ")))       // 1（文字数）
-myon.print(myon.string.byte_length(str("あ")))  // 3（バイト数）
+myon.print(myon.string.length_chars(str("あ")))  // 1（文字数）
+myon.print(myon.string.length(str("あ")))         // 3（バイト数）
 sub, err = myon.string.substring(str("こんにちは"), 1, 3)  // "んにち"（文字数ベース）
 myon.print(myon.string.index_of(str("こんにちは"), str("にち")))  // 2（文字数ベース）
 parts = myon.string.split(str("a,b,c"), str(","))          // ["a", "b", "c"]

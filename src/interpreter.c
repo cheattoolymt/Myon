@@ -1433,17 +1433,18 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
 
     /* ---- myon.string ---- */
     if (strcmp(name, "myon.string.length") == 0) {
-        /* Unicode code-point count, not byte count (Step2). */
+        /* Raw byte length (strlen). Kept as the original byte-count
+         * behavior for backward compatibility. */
         Value a = eval_arg(it, env, call, 0);
         if (a.type != TYPE_STR) { value_free(&a); runtime_error(it, line, "myon.string.length expects str"); }
-        *out = value_int(utf8_char_count(a.as.obj->as.str));
+        *out = value_int((long long)strlen(a.as.obj->as.str));
         value_free(&a); return 1;
     }
-    if (strcmp(name, "myon.string.byte_length") == 0) {
-        /* Raw byte length (strlen), for callers that need the encoded size. */
+    if (strcmp(name, "myon.string.length_chars") == 0) {
+        /* Unicode code-point count, not byte count. */
         Value a = eval_arg(it, env, call, 0);
-        if (a.type != TYPE_STR) { value_free(&a); runtime_error(it, line, "myon.string.byte_length expects str"); }
-        *out = value_int((long long)strlen(a.as.obj->as.str));
+        if (a.type != TYPE_STR) { value_free(&a); runtime_error(it, line, "myon.string.length_chars expects str"); }
+        *out = value_int(utf8_char_count(a.as.obj->as.str));
         value_free(&a); return 1;
     }
     if (strcmp(name, "myon.string.concat") == 0) {
