@@ -1545,6 +1545,63 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
 
 static int typespec_matches_value(Interp *it, TypeSpec *ts, const Value *v);
 
+/* Ascending comparison for myon.array.sort() (Phase4, Step1).
+ * qsort's compar callback receives only void* pointers with no user-data
+ * channel (C11 qsort has no context argument), so the element type is
+ * decided per comparison by inspecting each Value's .type field directly.
+ *   - int   vs int   : compare as long long
+ *   - float vs float : compare as double
+ *   - int/float mix  : promote both to double (same rule as as_number)
+ *   - str   vs str   : strcmp() byte-wise lexicographic order
+ * Any other combination is not comparable; callers must reject such arrays
+ * before invoking qsort (see the sort() dispatch below), so this function
+ * only ever sees the comparable cases and falls back to 0 defensively. */
+static int array_value_compare_asc(const void *pa, const void *pb) {
+    const Value *a = (const Value *)pa;
+    const Value *b = (const Value *)pb;
+
+    if (a->type == TYPE_STR && b->type == TYPE_STR)
+        return strcmp(a->as.obj->as.str, b->as.obj->as.str);
+
+    int a_num = (a->type == TYPE_INT || a->type == TYPE_FLOAT);
+    int b_num = (b->type == TYPE_INT || b->type == TYPE_FLOAT);
+    if (a_num && b_num) {
+        if (a->type == TYPE_INT && b->type == TYPE_INT) {
+            long long x = a->as.i, y = b->as.i;
+            return (x < y) ? -1 : (x > y) ? 1 : 0;
+        }
+        double x = (a->type == TYPE_INT) ? (double)a->as.i : a->as.f;
+        double y = (b->type == TYPE_INT) ? (double)b->as.i : b->as.f;
+        return (x < y) ? -1 : (x > y) ? 1 : 0;
+    }
+    return 0; /* unreachable: callers pre-validate element comparability */
+}
+
+/* Reverse an array's elements in place (shared by reverse() and sort_desc()). */
+static void array_reverse_inplace(ArrayData *a) {
+    for (int i = 0, j = a->count - 1; i < j; i++, j--) {
+        Value tmp = a->items[i];
+        a->items[i] = a->items[j];
+        a->items[j] = tmp;
+    }
+}
+
+/* Return 1 when every element of `a` is a comparable type (int/float/str);
+ * mixing numeric with str is still rejected because strcmp vs numeric order
+ * is undefined. Returns 0 for empty arrays only vacuously (treated as OK by
+ * caller). Sets *has_str / *has_num so the caller can reject numeric/str mix. */
+static int array_all_sortable(const ArrayData *a) {
+    int has_str = 0, has_num = 0;
+    for (int i = 0; i < a->count; i++) {
+        Type t = a->items[i].type;
+        if (t == TYPE_STR) has_str = 1;
+        else if (t == TYPE_INT || t == TYPE_FLOAT) has_num = 1;
+        else return 0; /* array/map/struct/func/bool/nil -> not sortable */
+    }
+    if (has_str && has_num) return 0; /* cannot compare str against numbers */
+    return 1;
+}
+
 static Value call_method(Interp *it, Env *env, Expr *call, Value recv,
                          const char *method) {
     int line = call->line;
@@ -1574,6 +1631,131 @@ static Value call_method(Interp *it, Env *env, Expr *call, Value recv,
         if (strcmp(method, "length") == 0) {
             return value_int(a->count);
         }
+        /* ---- Phase4, Step1: sort / sort_desc / reverse / contains /
+         *      index_of / slice ---- */
+        if (strcmp(method, "sort") == 0) {
+            if (argc != 0) runtime_error(it, line, "sort expects 0 arguments");
+            if (!array_all_sortable(a))
+                runtime_error(it, line,
+                    "sort: array elements must all be int, float or str "
+                    "(and numbers cannot be mixed with strings)");
+            if (a->count > 1)
+                qsort(a->items, (size_t)a->count, sizeof(Value),
+                      array_value_compare_asc);
+            return value_void();
+        }
+        if (strcmp(method, "sort_desc") == 0) {
+            if (argc != 0) runtime_error(it, line, "sort_desc expects 0 arguments");
+            if (!array_all_sortable(a))
+                runtime_error(it, line,
+                    "sort_desc: array elements must all be int, float or str "
+                    "(and numbers cannot be mixed with strings)");
+            if (a->count > 1) {
+                qsort(a->items, (size_t)a->count, sizeof(Value),
+                      array_value_compare_asc);
+                array_reverse_inplace(a);
+            }
+            return value_void();
+        }
+        if (strcmp(method, "reverse") == 0) {
+            if (argc != 0) runtime_error(it, line, "reverse expects 0 arguments");
+            array_reverse_inplace(a);
+            return value_void();
+        }
+        if (strcmp(method, "contains") == 0) {
+            if (argc != 1) runtime_error(it, line, "contains expects 1 argument");
+            Value v = eval_expr(it, env, call->as.call.args[0]);
+            int found = 0;
+            for (int i = 0; i < a->count; i++) {
+                if (value_equal(&a->items[i], &v)) { found = 1; break; }
+            }
+            value_free(&v);
+            return value_bool(found);
+        }
+        if (strcmp(method, "index_of") == 0) {
+            if (argc != 1) runtime_error(it, line, "index_of expects 1 argument");
+            Value v = eval_expr(it, env, call->as.call.args[0]);
+            long long idx = -1;
+            for (int i = 0; i < a->count; i++) {
+                if (value_equal(&a->items[i], &v)) { idx = i; break; }
+            }
+            value_free(&v);
+            return value_int(idx);
+        }
+        if (strcmp(method, "slice") == 0) {
+            if (argc != 2) runtime_error(it, line, "slice expects 2 arguments");
+            Value vs = eval_expr(it, env, call->as.call.args[0]);
+            Value vl = eval_expr(it, env, call->as.call.args[1]);
+            if (vs.type != TYPE_INT || vl.type != TYPE_INT) {
+                value_free(&vs); value_free(&vl);
+                runtime_error(it, line, "slice expects (int, int)");
+            }
+            long long start = vs.as.i, len = vl.as.i;
+            value_free(&vs); value_free(&vl);
+            if (start < 0 || len < 0 || start + len > (long long)a->count) {
+                return make_result_pair(
+                    value_array(a->elem_type ? typespec_clone(a->elem_type) : NULL),
+                    value_error(myon_strdup("myon.array.slice: range out of bounds")));
+            }
+            Value res = value_array(a->elem_type ? typespec_clone(a->elem_type) : NULL);
+            for (long long i = start; i < start + len; i++)
+                array_push(&res, value_copy(&a->items[i]));
+            return make_result_pair(res, value_nil());
+        }
+        /* ---- Phase4, Step3: map / filter / reduce (higher-order,
+         *      lambda-friendly; reuse call_function) ---- */
+        if (strcmp(method, "map") == 0) {
+            if (argc != 1) runtime_error(it, line, "map expects 1 argument");
+            Value f = eval_expr(it, env, call->as.call.args[0]);
+            /* Element type of the result is inferred from the first mapped
+             * value's runtime type; an empty input yields an untyped array. */
+            Value res = value_array(NULL);
+            int typed = 0;
+            for (int i = 0; i < a->count; i++) {
+                Value elem = value_copy(&a->items[i]);
+                Value r = call_function(it, line, f, &elem, 1, NULL);
+                value_free(&elem);
+                if (!typed) {
+                    res.as.obj->as.arr.elem_type = typespec_prim(r.type);
+                    typed = 1;
+                }
+                array_push(&res, r);
+            }
+            value_free(&f);
+            return res;
+        }
+        if (strcmp(method, "filter") == 0) {
+            if (argc != 1) runtime_error(it, line, "filter expects 1 argument");
+            Value f = eval_expr(it, env, call->as.call.args[0]);
+            Value res = value_array(a->elem_type ? typespec_clone(a->elem_type) : NULL);
+            for (int i = 0; i < a->count; i++) {
+                Value elem = value_copy(&a->items[i]);
+                Value r = call_function(it, line, f, &elem, 1, NULL);
+                int keep = value_truthy(&r);
+                value_free(&r);
+                if (keep) array_push(&res, elem);
+                else value_free(&elem);
+            }
+            value_free(&f);
+            return res;
+        }
+        if (strcmp(method, "reduce") == 0) {
+            if (argc != 2) runtime_error(it, line, "reduce expects 2 arguments");
+            Value f = eval_expr(it, env, call->as.call.args[0]);
+            Value acc = eval_expr(it, env, call->as.call.args[1]);
+            for (int i = 0; i < a->count; i++) {
+                Value args2[2];
+                args2[0] = value_copy(&acc);
+                args2[1] = value_copy(&a->items[i]);
+                Value r = call_function(it, line, f, args2, 2, NULL);
+                value_free(&args2[0]);
+                value_free(&args2[1]);
+                value_free(&acc);
+                acc = r;
+            }
+            value_free(&f);
+            return acc;
+        }
         runtime_error(it, line, "unknown array method '%s'", method);
     }
 
@@ -1602,6 +1784,28 @@ static Value call_method(Interp *it, Env *env, Expr *call, Value recv,
             int ok = map_delete(&recv, &k);
             value_free(&k);
             return value_bool(ok);
+        }
+        /* ---- Phase4, Step2: keys / values / length ---- */
+        MapData *m = &recv.as.obj->as.map;
+        if (strcmp(method, "keys") == 0) {
+            if (argc != 0) runtime_error(it, line, "keys expects 0 arguments");
+            Value arr = value_array(m->key_type ? typespec_clone(m->key_type) : NULL);
+            for (MapEntry *e = m->head; e; e = e->next)
+                array_push(&arr, value_copy(&e->key));
+            return arr;
+        }
+        if (strcmp(method, "values") == 0) {
+            if (argc != 0) runtime_error(it, line, "values expects 0 arguments");
+            Value arr = value_array(m->val_type ? typespec_clone(m->val_type) : NULL);
+            for (MapEntry *e = m->head; e; e = e->next)
+                array_push(&arr, value_copy(&e->val));
+            return arr;
+        }
+        if (strcmp(method, "length") == 0) {
+            if (argc != 0) runtime_error(it, line, "length expects 0 arguments");
+            long long n = 0;
+            for (MapEntry *e = m->head; e; e = e->next) n++;
+            return value_int(n);
         }
         runtime_error(it, line, "unknown map method '%s'", method);
     }
