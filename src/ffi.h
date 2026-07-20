@@ -89,4 +89,40 @@ int ffi_mem_free(FFIState *st, long long block_id);
  */
 char *ffi_read_cstring(long long addr, long long max_len);
 
+/*
+ * Phase3.1 — byte-level read/write on a memory block.
+ *
+ * These operate on a block ID (from ffi_mem_alloc), NOT a raw address, so an
+ * invalid ID or an out-of-range span can never corrupt memory.  A block plus
+ * a separately-tracked valid length is Myon's stand-in for a length-prefixed
+ * byte string (no dedicated byte-string value type is introduced in this
+ * phase).
+ */
+
+/*
+ * Write `len` bytes from `data` into block `block_id` starting at `offset`.
+ * Fails (returns 0) if the ID is invalid/freed or [offset, offset+len) would
+ * run past the end of the block.  Returns 1 on success.
+ */
+int ffi_mem_write(FFIState *st, long long block_id, long long offset,
+                  const unsigned char *data, long long len);
+
+/*
+ * Read `len` bytes from block `block_id` starting at `offset` into a freshly
+ * heap-allocated buffer (caller frees).  Returns NULL for an invalid/freed ID
+ * or an out-of-range span.
+ */
+unsigned char *ffi_mem_read(FFIState *st, long long block_id, long long offset,
+                            long long len);
+
+/*
+ * Phase3.1 — read 8 bytes of block `block_id` at `offset` as a little-endian
+ * int64 (x86-64 native order).  This is the convenience path for pulling an
+ * out-parameter pointer (e.g. the `sqlite3*` written by sqlite3_open) back out
+ * of a block as a plain address value.  Returns 1 on success and stores the
+ * value in *out; returns 0 for an invalid ID or an out-of-range span.
+ */
+int ffi_mem_read_i64(FFIState *st, long long block_id, long long offset,
+                     long long *out);
+
 #endif /* MYON_FFI_H */

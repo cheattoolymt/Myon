@@ -1,0 +1,29 @@
+# Phase3.1: byte-level write/read + passing a buffer to a C function with 'b'.
+#
+# 1. Roundtrip: write "hello" into a block and read it back.
+# 2. Feed those bytes to libz crc32() via sig "ibi" (the buffer arg is 'b').
+#    crc32(0, "hello", 5) == 907060870 (matches Python zlib.crc32(b"hello")).
+module myon.ffi
+
+id, aerr = myon.ffi.alloc(16)
+myon.if aerr != myon.nil then { myon.print(str("alloc_err")) } myon.else { myon.print(str("alloc_ok")) }
+
+w, we = myon.ffi.write_bytes(id, 0, str("hello"))
+myon.print(w)
+
+back, re = myon.ffi.read_bytes(id, 0, 5)
+myon.print(back)
+
+# Out-of-range write must error, not corrupt memory.
+bad, be = myon.ffi.write_bytes(id, 14, str("hello"))
+myon.if be != myon.nil then { myon.print(str("oob_err")) } myon.else { myon.print(str("oob_ok")) }
+
+handle, le = myon.ffi.load(str("libz.so.1"))
+myon.if le != myon.nil then { myon.print(str("LOAD_FAIL")) } myon.else { myon.print(str("loaded")) }
+
+crc, ce = myon.ffi.call_i(handle, str("crc32"), str("ibi"), 0, id, 5)
+myon.print(crc)
+
+f, fe = myon.ffi.free(id)
+ok, cle = myon.ffi.close(handle)
+myon.print(ok)

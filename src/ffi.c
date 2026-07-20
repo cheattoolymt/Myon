@@ -116,6 +116,49 @@ int ffi_mem_free(FFIState *st, long long block_id) {
     return 1;
 }
 
+int ffi_mem_write(FFIState *st, long long block_id, long long offset,
+                  const unsigned char *data, long long len) {
+    if (len < 0 || offset < 0) return 0;
+    long long size = ffi_mem_size(st, block_id);
+    if (size < 0) return 0;                 /* invalid / freed */
+    if (offset > size || len > size - offset) return 0; /* out of range */
+    void *base = ffi_mem_ptr(st, block_id);
+    if (!base) return 0;
+    if (len > 0) memcpy((unsigned char *)base + offset, data, (size_t)len);
+    return 1;
+}
+
+unsigned char *ffi_mem_read(FFIState *st, long long block_id, long long offset,
+                            long long len) {
+    if (len < 0 || offset < 0) return NULL;
+    long long size = ffi_mem_size(st, block_id);
+    if (size < 0) return NULL;              /* invalid / freed */
+    if (offset > size || len > size - offset) return NULL; /* out of range */
+    void *base = ffi_mem_ptr(st, block_id);
+    if (!base) return NULL;
+    unsigned char *dst = (unsigned char *)myon_xmalloc((size_t)len + 1);
+    if (len > 0) memcpy(dst, (unsigned char *)base + offset, (size_t)len);
+    dst[len] = '\0'; /* NUL guard so callers may treat it as a C string */
+    return dst;
+}
+
+int ffi_mem_read_i64(FFIState *st, long long block_id, long long offset,
+                     long long *out) {
+    if (offset < 0) return 0;
+    long long size = ffi_mem_size(st, block_id);
+    if (size < 0) return 0;                 /* invalid / freed */
+    if (offset > size || (long long)sizeof(long long) > size - offset) return 0;
+    const unsigned char *base = (const unsigned char *)ffi_mem_ptr(st, block_id);
+    if (!base) return 0;
+    /* assemble little-endian (x86-64 native) */
+    unsigned long long v = 0;
+    for (int i = 0; i < 8; i++) {
+        v |= (unsigned long long)base[offset + i] << (8 * i);
+    }
+    *out = (long long)v;
+    return 1;
+}
+
 char *ffi_read_cstring(long long addr, long long max_len) {
     if (addr == 0) return NULL; /* NULL pointer */
     if (max_len <= 0) return NULL;
