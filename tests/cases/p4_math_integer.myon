@@ -1,0 +1,23 @@
+# Phase4 Step4: myon.math.gcd / lcm / pow_int (int64-exact integer ops).
+module myon.stdio
+module myon.math
+
+# gcd (always non-negative; negatives are taken as absolute values)
+myon.print(myon.math.gcd(12, 18))     # 6
+myon.print(myon.math.gcd(-12, 18))    # 6
+
+# lcm
+l1, le1 = myon.math.lcm(4, 6)
+myon.print(l1)                         # 12
+
+# pow_int: exact int64 (no double round-trip)
+p1, pe1 = myon.math.pow_int(2, 62)
+myon.print(p1)                         # 4611686018427387904
+
+# negative exponent -> error
+p2, pe2 = myon.math.pow_int(2, -1)
+myon.if pe2 != myon.nil then { myon.print(str("pow_neg_err")) } myon.else { myon.print(str("pow_neg_ok")) }
+
+# int64 overflow -> error (2^63 is out of range)
+p3, pe3 = myon.math.pow_int(2, 63)
+myon.if pe3 != myon.nil then { myon.print(str("pow_overflow_err")) } myon.else { myon.print(str("pow_overflow_ok")) }

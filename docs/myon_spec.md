@@ -317,6 +317,46 @@ len = xs.length()        // 要素数取得
 xs.push("文字列")        // エラー：型不一致
 ```
 
+### 7.1 配列メソッド（Phase4）
+
+`push` / `pop` / `length` に加え、並べ替え・検索・部分取得・高階関数の
+メソッドを備える。`sort` / `sort_desc` / `reverse` は**破壊的**（呼び出し
+元の配列をその場で書き換える）で、それ以外は元の配列を変更せず新しい
+配列や値を返す。
+
+| メソッド | シグネチャ | 説明 |
+|------|-----------|------|
+| `push` | `(v: T) ret void` | 末尾に追加（型不一致は`error`） |
+| `pop` | `() ret T` | 末尾を削除して返す |
+| `length` | `() ret int` | 要素数 |
+| `sort` | `() ret void` | 昇順にその場でソート（破壊的）。要素は全て`int`/`float`/`str`である必要がある（混在した`int`/`float`は`double`比較、`str`は`strcmp`のバイト列辞書順）。それ以外の型が混ざると`runtime_error` |
+| `sort_desc` | `() ret void` | 降順にその場でソート（破壊的）。比較ロジックは`sort`と同じ |
+| `reverse` | `() ret void` | 要素順をその場で反転（破壊的） |
+| `contains` | `(v) ret bool` | `v`と等しい要素が存在するか（`value_equal`） |
+| `index_of` | `(v) ret int` | `v`と最初に等しい要素の位置（0-indexed）。無ければ`-1` |
+| `slice` | `(start: int, len: int) ret myon.array(T), error` | `start`番目から`len`個を取り出した新しい配列。`start`/`len`が負、または`start+len`が配列長超過なら`error` |
+| `map` | `(f) ret myon.array(?)` | 各要素に1引数関数/ラムダ`f`を適用した新しい配列。要素型は先頭要素の変換結果から推定（空配列は型無し） |
+| `filter` | `(f) ret myon.array(T)` | `f`の結果がtruthyな要素だけを残した新しい配列（要素型は元と同じ） |
+| `reduce` | `(f, init) ret ?` | `acc=init`から左畳み込み（各要素で`acc = f(acc, elem)`）。空配列は`init`をそのまま返す |
+
+`map` / `filter` / `reduce` は `myon.lambda` を引数に取れる高階関数である。
+
+```myon
+xs = myon.array(int)
+xs.push(3)
+xs.push(1)
+xs.push(2)
+xs.sort()                       // [1, 2, 3]（破壊的）
+xs.sort_desc()                  // [3, 2, 1]
+xs.reverse()                    // [1, 2, 3]
+myon.print(xs.contains(2))      // true
+myon.print(xs.index_of(2))      // 1
+mid, merr = xs.slice(1, 2)      // [2, 3]（元の配列は不変）
+
+doubled = xs.map(myon.lambda(x: int) ret int { ret x * 2 })       // [2, 4, 6]
+sum = xs.reduce(myon.lambda(acc: int, x: int) ret int { ret acc + x }, 0)  // 6
+```
+
 ---
 
 ## 8. 構造体（struct）
@@ -1019,6 +1059,37 @@ m.set(str("age"), 20)
 v = m.get(str("age"))
 m.delete(str("age"))
 has = m.has(str("age"))
+```
+
+#### マップメソッド（Phase4）
+
+`set` / `get` / `has` / `delete` に加え、中身を列挙するメソッドを備える。
+
+| メソッド | シグネチャ | 説明 |
+|------|-----------|------|
+| `set` | `(k: K, v: V) ret void` | キー`k`に値`v`を設定 |
+| `get` | `(k: K) ret V` | キー`k`の値（無ければ`myon.nil`） |
+| `has` | `(k: K) ret bool` | キー`k`が存在するか |
+| `delete` | `(k: K) ret bool` | キー`k`を削除（削除できたか） |
+| `keys` | `() ret myon.array(K)` | 全キーを要素型`K`の配列で返す |
+| `values` | `() ret myon.array(V)` | 全値を要素型`V`の配列で返す |
+| `length` | `() ret int` | エントリ数 |
+
+`keys()` / `values()` の要素順序は保証しない（このPhaseでは順序を仕様に
+含めない）。順序に依存しない検証をするか、必要なら返った配列を `sort()`
+してから使うこと。
+
+```myon
+m = myon.map(str, int)
+m.set(str("a"), 1)
+m.set(str("b"), 2)
+m.set(str("c"), 3)
+myon.print(m.length())          // 3
+ks = m.keys()
+ks.sort()
+myon.print(ks)                  // [a, b, c]
+vs = m.values()
+myon.print(vs.contains(2))      // true（順不同なので contains で確認）
 ```
 
 ### 14.3 関数内の制御フロー

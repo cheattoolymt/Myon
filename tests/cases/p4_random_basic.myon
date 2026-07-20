@@ -1,0 +1,33 @@
+# Phase4 Step6: myon.random.seed / int / float.
+# The concrete random values depend on the C library's rand() implementation,
+# so only the deterministic invariants are printed (range membership, the
+# lo > hi error, and the [0.0, 1.0) bound). Reproducibility of srand+rand is
+# verified manually per the instructions.
+module myon.stdio
+module myon.random
+
+myon.random.seed(42)
+
+# int(1, 6) x 10 must always land in [1, 6]
+in_range = true
+i = 0
+myon.while i < 10 {
+    v, verr = myon.random.int(1, 6)
+    myon.if v < 1 myon.or v > 6 then { in_range = false }
+    i += 1
+}
+myon.print(in_range)              # true
+
+# lo > hi -> error
+b, berr = myon.random.int(5, 1)
+myon.if berr != myon.nil then { myon.print(str("int_lohi_err")) } myon.else { myon.print(str("int_lohi_ok")) }
+
+# float() x 10 must always land in [0.0, 1.0)
+f_ok = true
+j = 0
+myon.while j < 10 {
+    f = myon.random.float()
+    myon.if f < 0.0 myon.or f >= 1.0 then { f_ok = false }
+    j += 1
+}
+myon.print(f_ok)                  # true

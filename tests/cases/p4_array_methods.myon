@@ -1,0 +1,38 @@
+# Phase4 Step1: myon.array sort / sort_desc / reverse / contains /
+# index_of / slice.
+module myon.stdio
+
+# sort / sort_desc on ints (in-place, destructive)
+xs = myon.array(int)
+xs.push(3)
+xs.push(1)
+xs.push(2)
+xs.sort()
+myon.print(xs)          # [1, 2, 3]
+xs.sort_desc()
+myon.print(xs)          # [3, 2, 1]
+
+# reverse (in-place)
+xs.reverse()
+myon.print(xs)          # [1, 2, 3]
+
+# contains / index_of
+myon.print(xs.contains(2))    # true
+myon.print(xs.contains(99))   # false
+myon.print(xs.index_of(2))    # 1
+myon.print(xs.index_of(99))   # -1
+
+# slice on a str array; original is left unchanged
+ss = myon.array(str)
+ss.push(str("a"))
+ss.push(str("b"))
+ss.push(str("c"))
+ss.push(str("d"))
+ss.push(str("e"))
+mid, merr = ss.slice(1, 3)
+myon.print(mid)               # [b, c, d]
+myon.print(ss)                # [a, b, c, d, e] (unchanged)
+
+# out-of-range slice returns an error
+bad, berr = ss.slice(0, 100)
+myon.if berr != myon.nil then { myon.print(str("slice_range_err")) } myon.else { myon.print(str("slice_range_ok")) }
