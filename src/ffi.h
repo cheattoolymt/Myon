@@ -125,4 +125,114 @@ unsigned char *ffi_mem_read(FFIState *st, long long block_id, long long offset,
 int ffi_mem_read_i64(FFIState *st, long long block_id, long long offset,
                      long long *out);
 
+/*
+ * Phase4.1, Step1 — typed memory writes.
+ *
+ * These are the write-side counterparts of ffi_mem_read_i64.  Unlike
+ * ffi_mem_write (which copies the bytes of a NUL-terminated Myon str and
+ * therefore stops at the first embedded NUL), these encode a scalar directly,
+ * so values whose little-endian byte pattern contains NUL bytes (e.g. small
+ * ints) are written in full.  All values are laid out in x86-64 native
+ * (little-endian) order.  Each returns 1 on success and 0 for an invalid /
+ * freed block ID or an out-of-range span (never corrupts memory).
+ */
+
+/* Write `v` at `offset` as a little-endian 8-byte int64. */
+int ffi_mem_write_i64(FFIState *st, long long block_id,
+                      long long offset, long long v);
+
+/* Write `v` at `offset` as a 4-byte int32 (upper 32 bits truncated). */
+int ffi_mem_write_i32(FFIState *st, long long block_id,
+                      long long offset, long long v);
+
+/* Write `v` at `offset` as an 8-byte IEEE-754 double (native order). */
+int ffi_mem_write_f64(FFIState *st, long long block_id,
+                      long long offset, double v);
+
+/* Write `v` at `offset` as a 4-byte IEEE-754 float (v converted first). */
+int ffi_mem_write_f32(FFIState *st, long long block_id,
+                      long long offset, double v);
+
+/*
+ * Phase4.1, Step2 — struct layout DSL.
+ *
+ * A struct layout is a named list of field kinds; the interpreter computes each
+ * field's offset using natural alignment (a 4-byte field aligns to 4 bytes, an
+ * 8-byte field to 8 bytes) and pads the total size up to the largest field's
+ * alignment — the same rules a C compiler applies to a plain struct.  No real C
+ * header is ever consulted: the layout is whatever the Myon script declares.
+ * Layouts are stored inside FFIState alongside memory blocks and libraries.
+ */
+
+typedef enum {
+    FFI_FIELD_I32,
+    FFI_FIELD_I64,
+    FFI_FIELD_F32,
+    FFI_FIELD_F64
+} FFIFieldKind;
+
+/*
+ * Define (or redefine) the struct layout `name` from `field_kinds` (length
+ * `field_count`).  A pre-existing definition with the same name is overwritten.
+ * Returns the total size in bytes, or -1 on invalid arguments (NULL name, empty
+ * field list, unknown kind).
+ */
+long long ffi_struct_define(FFIState *st, const char *name,
+                            const FFIFieldKind *field_kinds,
+                            int field_count);
+
+/*
+ * Offset (in bytes) of field `field_index` in the layout `name`, or -1 for an
+ * undefined name or an out-of-range index.
+ */
+long long ffi_struct_field_offset(FFIState *st, const char *name,
+                                  int field_index);
+
+/* Total size in bytes of the layout `name`, or -1 if undefined. */
+long long ffi_struct_size(FFIState *st, const char *name);
+
+/* Number of fields in layout `name`, or -1 if undefined. */
+int ffi_struct_field_count(FFIState *st, const char *name);
+
+/* Kind of field `field_index` in layout `name`.  Returns 1 and stores the kind
+ * in *out on success; 0 for an undefined name or out-of-range index. */
+int ffi_struct_field_kind(FFIState *st, const char *name, int field_index,
+                          FFIFieldKind *out);
+
+/*
+ * Phase4.1, Step3 — bulk array read/write.
+ *
+ * Read/write `count` same-typed scalars contiguously starting at `offset`.  The
+ * i32/i64 variants marshal a Myon int array (carried as long long*), while the
+ * f32/f64 variants marshal a Myon float array (carried as double*).  Each
+ * returns 1 on success, 0 for an invalid/freed block or an out-of-range span
+ * (offset + count*elem_size must fit inside the block).  Reads write into a
+ * caller-provided out buffer of `count` elements.
+ */
+int ffi_mem_write_array_i32(FFIState *st, long long block_id,
+                            long long offset,
+                            const long long *values, long long count);
+int ffi_mem_write_array_i64(FFIState *st, long long block_id,
+                            long long offset,
+                            const long long *values, long long count);
+int ffi_mem_write_array_f32(FFIState *st, long long block_id,
+                            long long offset,
+                            const double *values, long long count);
+int ffi_mem_write_array_f64(FFIState *st, long long block_id,
+                            long long offset,
+                            const double *values, long long count);
+
+int ffi_mem_read_array_i32(FFIState *st, long long block_id,
+                           long long offset,
+                           long long *out_values, long long count);
+int ffi_mem_read_array_i64(FFIState *st, long long block_id,
+                           long long offset,
+                           long long *out_values, long long count);
+int ffi_mem_read_array_f32(FFIState *st, long long block_id,
+                           long long offset,
+                           double *out_values, long long count);
+int ffi_mem_read_array_f64(FFIState *st, long long block_id,
+                           long long offset,
+                           double *out_values, long long count);
+
 #endif /* MYON_FFI_H */

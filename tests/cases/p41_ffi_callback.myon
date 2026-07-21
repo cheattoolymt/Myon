@@ -1,0 +1,30 @@
+# Phase4.1, Step4: C-to-Myon callbacks via the fixture shared library.
+# run_tests.sh builds tests/fixtures/libffi_callback_test.so first.
+module myon.ffi
+module myon.stdio
+
+printer = myon.lambda(x: int) ret int {
+    myon.print(x)
+    ret 0
+}
+adder = myon.lambda(a: int, b: int) ret int { ret a + b }
+
+h, e = myon.ffi.load(str("tests/fixtures/libffi_callback_test.so"))
+myon.if e != myon.nil then { myon.print(str("load_fail")) } myon.else {
+    cbp, ec = myon.ffi.make_callback(printer, 1)
+    ok, eo = myon.ffi.call_v(h, str("call_twice"), str("pi"), cbp, 10)  # prints 10, 11
+
+    s, es = myon.ffi.make_callback(adder, 2)
+    r, er = myon.ffi.call_i(h, str("call_sum"), str("pii"), s, 3, 4)
+    myon.print(r)                                                        # 7
+
+    # free then re-register: the freed slot must be reusable
+    fc, efc = myon.ffi.free_callback(cbp)
+    myon.print(fc)                                                       # true
+    cbp2, ec2 = myon.ffi.make_callback(printer, 1)
+    ok2, eo2 = myon.ffi.call_v(h, str("call_twice"), str("pi"), cbp2, 20) # prints 20, 21
+
+    myon.ffi.free_callback(s)
+    myon.ffi.free_callback(cbp2)
+    myon.ffi.close(h)
+}

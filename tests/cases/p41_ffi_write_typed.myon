@@ -1,0 +1,39 @@
+# Phase4.1, Step1: typed memory writes (write_i64/i32/f64/f32).
+#
+# Unlike write_bytes (which copies a NUL-terminated str and stops at the first
+# embedded NUL), the typed writers encode the value's raw little-endian bytes,
+# so a value whose byte pattern contains NUL bytes is written in full.
+module myon.ffi
+module myon.stdio
+
+id, e = myon.ffi.alloc(32)
+
+# Two int32 whose little-endian encodings both contain NUL bytes:
+#   100 -> 64 00 00 00, 200 -> C8 00 00 00
+# Reading the first 8 bytes as one int64 must give the combined value,
+# proving the NUL bytes were not treated as terminators.
+myon.ffi.write_i32(id, 0, 100)
+myon.ffi.write_i32(id, 4, 200)
+v, ev = myon.ffi.read_i64(id, 0)
+myon.print(v)              # 858993459300
+
+# int64 roundtrip through read_i64
+myon.ffi.write_i64(id, 8, 123456789012)
+v2, ev2 = myon.ffi.read_i64(id, 8)
+myon.print(v2)             # 123456789012
+
+# f64 roundtrip
+myon.ffi.write_f64(id, 16, 3.14)
+f, ef = myon.ffi.read_array_f64(id, 16, 1)
+myon.print(f)              # [3.14]
+
+# f32 roundtrip
+myon.ffi.write_f32(id, 24, 1.5)
+g, eg = myon.ffi.read_array_f32(id, 24, 1)
+myon.print(g)              # [1.5]
+
+# out-of-range write must error, not crash
+bad, be = myon.ffi.write_i64(id, 28, 1)
+myon.if be != myon.nil then { myon.print(str("oob_err")) } myon.else { myon.print(str("oob_bad")) }
+
+myon.ffi.free(id)
