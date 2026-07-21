@@ -31,6 +31,9 @@
 #include "ffi_call.h"
 #include "ffi_platform.h"
 #include "ffi_callback.h"
+#include "event_loop.h"
+#include "net.h"
+#include "http.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,6 +45,13 @@
 #include <ctype.h>
 #include <errno.h>
 #include <time.h>
+
+/* Phase5 myon.net: the synchronous fallback path in net_wait_fd() uses
+ * select(2) directly (outside a coroutine).  On Linux this lives behind
+ * <sys/select.h>; other platforms fall back to net.c's unsupported stub. */
+#if defined(__linux__)
+#include <sys/select.h>
+#endif
 
 /* Some C standard libraries only expose M_PI / M_E under _GNU_SOURCE or
  * similar feature-test macros; provide portable fallbacks (Phase3.5). */
@@ -90,6 +100,14 @@ struct Interp {
     /* Phase4 myon.random: 1 once the PRNG has been seeded (either explicitly
      * via myon.random.seed() or auto-seeded on first int()/float() use). */
     int          random_seeded;
+    /* Phase5: cooperative event loop + the task currently executing.  The
+     * loop is created lazily on first async/await/net use so plain scripts
+     * pay nothing.  current_task is the running coroutine (including the
+     * implicit top-level task) or NULL when no loop is active. */
+    EventLoop   *loop;
+    Task        *current_task;
+    /* Phase5 myon.net: socket table (lazily created on first myon.net use). */
+    NetState    *net;
 };
 typedef struct Interp Interp;
 
@@ -112,6 +130,12 @@ static Flow  exec_block(Interp *it, Env *env, StmtList *body);
 static Flow  exec_stmt(Interp *it, Env *env, Stmt *s);
 static Value call_function(Interp *it, int line, Value fn, Value *args, int argc,
                            char **arg_names);
+
+/* Phase5: ensure the event loop exists (lazy). */
+static EventLoop *ensure_loop(Interp *it) {
+    if (!it->loop) it->loop = event_loop_create();
+    return it->loop;
+}
 
 /* ------------------------------------------------------------------ */
 /* Struct registry                                                     */
@@ -1479,10 +1503,18 @@ static int call_time(Interp *it, Env *env, const char *name, Expr *call, Value *
         long long ms = a.as.i;
         value_free(&a);
         if (ms > 0) {
-            struct timespec req;
-            req.tv_sec  = (time_t)(ms / 1000);
-            req.tv_nsec = (long)((ms % 1000) * 1000000L);
-            nanosleep(&req, NULL);
+            /* Phase5: inside a coroutine driven by the event loop, yield to
+             * other tasks instead of blocking the whole process.  Outside any
+             * coroutine (plain synchronous scripts) fall back to the classic
+             * blocking nanosleep so pre-Phase5 semantics are preserved. */
+            if (it->current_task && it->loop) {
+                event_loop_sleep_ms(it->loop, ms);
+            } else {
+                struct timespec req;
+                req.tv_sec  = (time_t)(ms / 1000);
+                req.tv_nsec = (long)((ms % 1000) * 1000000L);
+                nanosleep(&req, NULL);
+            }
         }
         *out = value_void();
         return 1;
@@ -1554,6 +1586,213 @@ static int call_random(Interp *it, Env *env, const char *name, Expr *call, Value
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Standard library: myon.net.* (Phase5)                               */
+/*                                                                     */
+/* Non-blocking sockets (src/net.c).  When called from inside an        */
+/* event-loop coroutine we yield to other tasks on EWOULDBLOCK; outside */
+/* one we block on a single fd via the loop's wait helpers driven       */
+/* directly (a synchronous fallback for plain scripts).                 */
+/* ------------------------------------------------------------------ */
+
+static NetState *ensure_net(Interp *it) {
+    if (!it->net) it->net = net_state_create();
+    return it->net;
+}
+
+/* Wait until `fd` is readable/writable.  Inside a coroutine this suspends
+ * cooperatively; outside one it drives the loop / blocks on the single fd. */
+static void net_wait_fd(Interp *it, int fd, int for_write) {
+    if (it->current_task && it->loop) {
+        if (for_write) event_loop_wait_writable(it->loop, fd);
+        else           event_loop_wait_readable(it->loop, fd);
+        return;
+    }
+    /* synchronous fallback: block on just this fd */
+#if defined(__linux__)
+    fd_set fds; FD_ZERO(&fds); FD_SET(fd, &fds);
+    if (for_write) select(fd + 1, NULL, &fds, NULL, NULL);
+    else           select(fd + 1, &fds, NULL, NULL, NULL);
+#else
+    (void)fd; (void)for_write;
+#endif
+}
+
+static Value err_pair_str(const char *msg) {
+    return make_result_pair(value_str(myon_strdup("")), value_error(myon_strdup(msg)));
+}
+
+static int call_net(Interp *it, Env *env, const char *name, Expr *call, Value *out) {
+    int line = call->line;
+    NetState *st = ensure_net(it);
+    if (!net_supported()) {
+        *out = make_result_pair(value_int(-1),
+            value_error(myon_strdup("myon.net unsupported on this platform")));
+        return 1;
+    }
+
+    if (strcmp(name, "myon.net.tcp_socket") == 0 ||
+        strcmp(name, "myon.net.udp_socket") == 0) {
+        int kind = (name[9] == 'u') ? 1 : 0;
+        char *err = NULL;
+        int id = net_socket_create(st, kind, &err);
+        if (id < 0) { *out = make_result_pair(value_int(-1), value_error(err ? err : myon_strdup("socket failed"))); }
+        else        { *out = make_result_pair(value_int(id), value_nil()); }
+        return 1;
+    }
+
+    if (strcmp(name, "myon.net.bind") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1), c = eval_arg(it, env, call, 2);
+        char *err = NULL;
+        int rc = net_bind(st, (int)a.as.i, b.as.obj ? b.as.obj->as.str : "", (int)c.as.i, &err);
+        value_free(&a); value_free(&b); value_free(&c);
+        *out = make_result_pair(value_bool(rc == 0), rc == 0 ? value_nil() : value_error(err ? err : myon_strdup("bind failed")));
+        return 1;
+    }
+
+    if (strcmp(name, "myon.net.listen") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
+        char *err = NULL;
+        int rc = net_listen(st, (int)a.as.i, (int)b.as.i, &err);
+        value_free(&a); value_free(&b);
+        *out = make_result_pair(value_bool(rc == 0), rc == 0 ? value_nil() : value_error(err ? err : myon_strdup("listen failed")));
+        return 1;
+    }
+
+    if (strcmp(name, "myon.net.local_port") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        char *err = NULL;
+        int p = net_local_port(st, (int)a.as.i, &err);
+        value_free(&a);
+        if (p < 0) *out = make_result_pair(value_int(-1), value_error(err ? err : myon_strdup("local_port failed")));
+        else       *out = make_result_pair(value_int(p), value_nil());
+        return 1;
+    }
+
+    if (strcmp(name, "myon.net.accept") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        int lid = (int)a.as.i; value_free(&a);
+        int lfd = net_raw_fd(st, lid);
+        for (;;) {
+            char *peer = NULL, *err = NULL;
+            int cid = net_try_accept(st, lid, &peer, &err);
+            if (cid == -2) { free(peer); net_wait_fd(it, lfd, 0); continue; }
+            if (cid < 0)   { *out = make_result_pair(value_int(-1), value_error(err ? err : myon_strdup("accept failed"))); free(peer); return 1; }
+            free(peer);
+            *out = make_result_pair(value_int(cid), value_nil());
+            return 1;
+        }
+    }
+
+    if (strcmp(name, "myon.net.connect") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1), c = eval_arg(it, env, call, 2);
+        int sid = (int)a.as.i; const char *host = b.as.obj ? b.as.obj->as.str : ""; int port = (int)c.as.i;
+        int fd = net_raw_fd(st, sid);
+        char *err = NULL;
+        int rc = net_connect(st, sid, host, port, &err);
+        while (rc == -2) {
+            net_wait_fd(it, fd, 1);
+            free(err); err = NULL;
+            rc = net_connect_check(st, sid, &err);
+        }
+        value_free(&a); value_free(&b); value_free(&c);
+        *out = make_result_pair(value_bool(rc == 0), rc == 0 ? value_nil() : value_error(err ? err : myon_strdup("connect failed")));
+        return 1;
+    }
+
+    if (strcmp(name, "myon.net.send") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
+        int sid = (int)a.as.i; const char *data = b.as.obj ? b.as.obj->as.str : "";
+        long long len = (long long)strlen(data); int fd = net_raw_fd(st, sid);
+        char *err = NULL; long long n;
+        for (;;) {
+            n = net_send(st, sid, data, len, &err);
+            if (n == -2) { net_wait_fd(it, fd, 1); continue; }
+            break;
+        }
+        value_free(&a); value_free(&b);
+        if (n < 0) *out = make_result_pair(value_int(-1), value_error(err ? err : myon_strdup("send failed")));
+        else       *out = make_result_pair(value_int((long long)n), value_nil());
+        return 1;
+    }
+
+    if (strcmp(name, "myon.net.recv") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
+        int sid = (int)a.as.i; long long maxlen = b.as.i; int fd = net_raw_fd(st, sid);
+        value_free(&a); value_free(&b);
+        if (maxlen <= 0) maxlen = 4096;
+        char *buf = (char *)myon_xmalloc((size_t)maxlen + 1);
+        char *err = NULL; long long n;
+        for (;;) {
+            n = net_recv(st, sid, buf, maxlen, &err);
+            if (n == -2) { net_wait_fd(it, fd, 0); continue; }
+            break;
+        }
+        if (n < 0) { free(buf); *out = err_pair_str(err ? err : "recv failed"); if (err) free(err); return 1; }
+        buf[n] = '\0';
+        char *dup = (char *)myon_xmalloc((size_t)n + 1);
+        memcpy(dup, buf, (size_t)n); dup[n] = '\0'; free(buf);
+        *out = make_result_pair(value_str(dup), value_nil());
+        return 1;
+    }
+
+    if (strcmp(name, "myon.net.send_to") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1),
+              c = eval_arg(it, env, call, 2), d = eval_arg(it, env, call, 3);
+        int sid = (int)a.as.i; const char *data = b.as.obj ? b.as.obj->as.str : "";
+        long long len = (long long)strlen(data);
+        const char *host = c.as.obj ? c.as.obj->as.str : ""; int port = (int)d.as.i;
+        int fd = net_raw_fd(st, sid);
+        char *err = NULL; long long n;
+        for (;;) { n = net_sendto(st, sid, data, len, host, port, &err); if (n == -2) { net_wait_fd(it, fd, 1); continue; } break; }
+        value_free(&a); value_free(&b); value_free(&c); value_free(&d);
+        if (n < 0) *out = make_result_pair(value_int(-1), value_error(err ? err : myon_strdup("send_to failed")));
+        else       *out = make_result_pair(value_int((long long)n), value_nil());
+        return 1;
+    }
+
+    if (strcmp(name, "myon.net.recv_from") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
+        int sid = (int)a.as.i; long long maxlen = b.as.i; int fd = net_raw_fd(st, sid);
+        value_free(&a); value_free(&b);
+        if (maxlen <= 0) maxlen = 4096;
+        char *buf = (char *)myon_xmalloc((size_t)maxlen + 1);
+        char *from = NULL, *err = NULL; long long n;
+        for (;;) { n = net_recvfrom(st, sid, buf, maxlen, &from, &err); if (n == -2) { net_wait_fd(it, fd, 0); continue; } break; }
+        Value tup = value_array(NULL);
+        if (n < 0) {
+            array_push(&tup, value_str(myon_strdup("")));
+            array_push(&tup, value_str(myon_strdup("")));
+            array_push(&tup, value_error(err ? err : myon_strdup("recv_from failed")));
+        } else {
+            buf[n] = '\0';
+            array_push(&tup, value_str(myon_strdup(buf)));
+            /* `from` is a malloc'd "host:port" from net.c; hand it to a str
+             * value (which owns the heap pointer) or an empty string. */
+            array_push(&tup, value_str(from ? from : myon_strdup("")));
+            array_push(&tup, value_nil());
+        }
+        free(buf);
+        *out = tup;
+        (void)line;
+        return 1;
+    }
+
+    if (strcmp(name, "myon.net.close") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        net_close(st, (int)a.as.i);
+        value_free(&a);
+        *out = make_result_pair(value_bool(1), value_nil());
+        return 1;
+    }
+
+    return 0;
+}
+
+/* Phase5 myon.http dispatch (implemented after the async-task machinery,
+ * which the server loop depends on). */
+static int call_http(Interp *it, Env *env, const char *name, Expr *call, Value *out);
+
 /* dispatch a "myon.math.<fn>" or "myon.string.<fn>" call.
  * Returns 1 and sets *out if handled. */
 static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value *out) {
@@ -1578,6 +1817,16 @@ static int call_stdlib(Interp *it, Env *env, const char *name, Expr *call, Value
     /* ---- myon.random (Phase4, Step6) ---- */
     if (strncmp(name, "myon.random.", 12) == 0) {
         if (call_random(it, env, name, call, out)) return 1;
+    }
+
+    /* ---- myon.net (Phase5, Step4) ---- */
+    if (strncmp(name, "myon.net.", 9) == 0) {
+        if (call_net(it, env, name, call, out)) return 1;
+    }
+
+    /* ---- myon.http (Phase5, Step5) ---- */
+    if (strncmp(name, "myon.http.", 10) == 0) {
+        if (call_http(it, env, name, call, out)) return 1;
     }
 
     /* ---- myon.math ---- */
@@ -2650,6 +2899,585 @@ static Value call_function(Interp *it, int line, Value fn, Value *args, int argc
 }
 
 /* ------------------------------------------------------------------ */
+/* Phase5: async tasks (coroutines on the event loop)                  */
+/*                                                                     */
+/* Calling a `myon.async myon.func` no longer runs its body inline;    */
+/* instead it spawns an event-loop Task that runs the body on its own  */
+/* C stack.  The caller immediately gets back a TYPE_TASK value.        */
+/* `myon.await` suspends the current coroutine until the target task    */
+/* finishes, then yields the target's return value (or re-raises its    */
+/* runtime error).                                                      */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    Interp *it;
+    Value   fn;      /* owned copy of the async function value        */
+    Value  *args;    /* owned copies of the arguments                 */
+    int     argc;
+    Value  *result;  /* heap Value produced by the body (owned by task) */
+    Task   *task;    /* set after spawn so the entry can record result */
+} AsyncCtx;
+
+/* Entry point run on the task's own C stack. */
+static void async_task_entry(void *ud) {
+    AsyncCtx *ctx = (AsyncCtx *)ud;
+    Interp *it = ctx->it;
+
+    Task *prev_task = it->current_task;
+    it->current_task = ctx->task;
+
+    /* Install a local error barrier: a runtime_error inside the body must not
+     * longjmp across the coroutine boundary.  On error we finish the task with
+     * has_error=1 and store the error value so await can re-raise it. */
+    jmp_buf saved;
+    memcpy(&saved, &it->on_error, sizeof(jmp_buf));
+
+    Value *res = (Value *)myon_xmalloc(sizeof(Value));
+    int has_error = 0;
+
+    if (setjmp(it->on_error) == 0) {
+        *res = call_function(it, 0, ctx->fn, ctx->args, ctx->argc, NULL);
+    } else {
+        /* body raised: represent as an error value */
+        *res = value_error(myon_strdup("async task failed"));
+        has_error = 1;
+    }
+
+    memcpy(&it->on_error, &saved, sizeof(jmp_buf));
+    it->current_task = prev_task;
+
+    /* release the captured fn/args now that the body has finished */
+    value_free(&ctx->fn);
+    for (int i = 0; i < ctx->argc; i++) value_free(&ctx->args[i]);
+    free(ctx->args);
+
+    ctx->result = res;
+    event_loop_task_set_result(ctx->task, res, has_error);
+    free(ctx);
+}
+
+/* Spawn an async task for `fn(args...)` and return a TYPE_TASK value. */
+static Value spawn_async_task(Interp *it, Value fn, Value *args, int argc) {
+    EventLoop *loop = ensure_loop(it);
+
+    AsyncCtx *ctx = (AsyncCtx *)myon_xmalloc(sizeof(AsyncCtx));
+    ctx->it = it;
+    ctx->fn = value_copy(&fn);
+    ctx->args = argc ? (Value *)myon_xmalloc(sizeof(Value) * argc) : NULL;
+    for (int i = 0; i < argc; i++) ctx->args[i] = value_copy(&args[i]);
+    ctx->argc = argc;
+    ctx->result = NULL;
+    ctx->task = NULL;
+
+    Task *task = event_loop_spawn(loop, async_task_entry, ctx);
+    ctx->task = task;
+    return value_task(task);
+}
+
+/* Await a TYPE_TASK: drive the loop until it completes, then hand back its
+ * result value (moved out) or re-raise its error. */
+static Value await_task(Interp *it, int line, Value taskv) {
+    Task *target = (Task *)taskv.as.obj->as.task.task;
+    if (!target) {
+        runtime_error(it, line, "myon.await: invalid task handle");
+    }
+
+    if (!event_loop_task_done(target)) {
+        if (it->current_task) {
+            /* cooperative: suspend this coroutine until target finishes */
+            event_loop_wait_task(it->loop, target);
+        } else {
+            /* no active coroutine context: drive the loop to completion */
+            while (!event_loop_task_done(target)) {
+                if (event_loop_run_once(it->loop) == 0) break;
+            }
+        }
+    }
+
+    Value *res = (Value *)event_loop_task_result(target);
+    int has_error = event_loop_task_has_error(target);
+
+    Value out;
+    if (res) {
+        out = *res;          /* move out */
+        free(res);
+        /* prevent double-free: clear the loop's pointer to this payload */
+        event_loop_task_set_result(target, NULL, has_error);
+    } else {
+        out = value_void();
+    }
+
+    if (has_error) {
+        char *msg = out.type == TYPE_ERROR ? myon_strdup(out.as.obj->as.str)
+                                           : myon_strdup("async task failed");
+        value_free(&out);
+        runtime_error(it, line, "%s", msg);
+    }
+    return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* Standard library: myon.http.* (Phase5, Step5)                       */
+/*                                                                     */
+/* Server side (serve_static / serve) is a native implementation on    */
+/* top of net.c + the event loop: an accept loop runs as a coroutine   */
+/* and each accepted connection is handled in its own spawned task.    */
+/* HTTP/1.0 only, one request per connection, no Keep-Alive.           */
+/*                                                                     */
+/* Client side (get / post) is a minimal self-contained TCP            */
+/* implementation (no libcurl dependency): plain http:// only, no       */
+/* redirects, no TLS.  https:// returns a "TLS not supported" error.    */
+/* See docs/myon_spec.md 10.6 for the rationale.                       */
+/* ------------------------------------------------------------------ */
+
+/* Read one whole HTTP request (headers + Content-Length body) from a socket.
+ * Returns 0 and fills *req on success; -1 on error/EOF (req untouched). */
+static int http_read_request(Interp *it, NetState *st, int sock_id,
+                             HttpRequest *req) {
+    int fd = net_raw_fd(st, sock_id);
+    size_t cap = 4096, len = 0;
+    char *buf = (char *)myon_xmalloc(cap);
+    size_t header_end = 0;
+
+    /* 1. read until we have the full header block */
+    for (;;) {
+        if (len == cap) { cap *= 2; buf = (char *)myon_xrealloc(buf, cap); }
+        char *err = NULL;
+        long long n = net_recv(st, sock_id, buf + len, (long long)(cap - len), &err);
+        if (n == -2) { free(err); net_wait_fd(it, fd, 0); continue; }
+        if (n < 0)   { free(err); free(buf); return -1; }
+        if (n == 0)  { free(buf); return -1; } /* EOF before full request */
+        len += (size_t)n;
+        header_end = http_find_header_end(buf, len);
+        if (header_end) break;
+        if (len > (1u << 20)) { free(buf); return -1; } /* 1MB header cap */
+    }
+
+    /* 2. figure out how much body we already have; read the rest if needed */
+    size_t have_body = len - header_end;
+    /* peek Content-Length without a full parse yet */
+    HttpRequest tmp;
+    if (http_parse_request(buf, header_end, buf + header_end, have_body, &tmp) != 0) {
+        free(buf);
+        return -1;
+    }
+    long want = tmp.content_length;
+    if (want > 0 && (size_t)want > have_body) {
+        size_t need = (size_t)want - have_body;
+        size_t need_cap = len + need;
+        if (need_cap > cap) { cap = need_cap; buf = (char *)myon_xrealloc(buf, cap); }
+        while (have_body < (size_t)want) {
+            char *err = NULL;
+            long long n = net_recv(st, sock_id, buf + len,
+                                   (long long)(cap - len), &err);
+            if (n == -2) { free(err); net_wait_fd(it, fd, 0); continue; }
+            if (n <= 0)  { free(err); break; } /* short body: use what we have */
+            len += (size_t)n;
+            have_body += (size_t)n;
+        }
+        /* re-parse with the complete body */
+        http_request_free(&tmp);
+        if (http_parse_request(buf, header_end, buf + header_end,
+                               have_body, &tmp) != 0) {
+            free(buf);
+            return -1;
+        }
+    }
+
+    *req = tmp;
+    free(buf);
+    return 0;
+}
+
+/* Send all `len` bytes on a socket, yielding on EWOULDBLOCK. */
+static void http_send_all(Interp *it, NetState *st, int sock_id,
+                          const char *data, size_t len) {
+    int fd = net_raw_fd(st, sock_id);
+    size_t off = 0;
+    while (off < len) {
+        char *err = NULL;
+        long long n = net_send(st, sock_id, data + off,
+                               (long long)(len - off), &err);
+        if (n == -2) { free(err); net_wait_fd(it, fd, 1); continue; }
+        if (n < 0)   { free(err); break; }
+        off += (size_t)n;
+    }
+}
+
+/* Serve a single request from an already-accepted static-file connection. */
+static void http_serve_static_conn(Interp *it, NetState *st, int conn_id,
+                                   const char *root_dir) {
+    HttpRequest req;
+    if (http_read_request(it, st, conn_id, &req) != 0) { net_close(st, conn_id); return; }
+
+    char *fspath = http_resolve_static_path(root_dir, req.path);
+    char *resp = NULL; size_t resp_len = 0;
+
+    if (!fspath) {
+        const char *body = "403 Forbidden";
+        resp = http_build_response(403, "Forbidden", "text/plain",
+                                   body, strlen(body), &resp_len);
+    } else {
+        FILE *f = fopen(fspath, "rb");
+        if (!f) {
+            const char *body = "404 Not Found";
+            resp = http_build_response(404, "Not Found", "text/plain",
+                                       body, strlen(body), &resp_len);
+        } else {
+            fseek(f, 0, SEEK_END);
+            long fsz = ftell(f);
+            if (fsz < 0) fsz = 0;
+            fseek(f, 0, SEEK_SET);
+            char *fbuf = (char *)myon_xmalloc((size_t)fsz + 1);
+            size_t rd = fread(fbuf, 1, (size_t)fsz, f);
+            fclose(f);
+            resp = http_build_response(200, "OK",
+                                       http_content_type_for_path(fspath),
+                                       fbuf, rd, &resp_len);
+            free(fbuf);
+        }
+        free(fspath);
+    }
+
+    if (resp) { http_send_all(it, st, conn_id, resp, resp_len); free(resp); }
+    http_request_free(&req);
+    net_close(st, conn_id);
+}
+
+/* --- context/entry for a single connection handled by a Myon handler --- */
+typedef struct {
+    Interp  *it;
+    NetState *st;
+    int      conn_id;
+    Value    handler;   /* owned TYPE_FUNC copy */
+    Task    *task;
+} HttpConnCtx;
+
+static void http_conn_task_entry(void *ud) {
+    HttpConnCtx *c = (HttpConnCtx *)ud;
+    Interp *it = c->it;
+
+    Task *prev = it->current_task;
+    it->current_task = c->task;
+
+    jmp_buf saved;
+    memcpy(&saved, &it->on_error, sizeof(jmp_buf));
+
+    HttpRequest req;
+    if (http_read_request(it, c->st, c->conn_id, &req) == 0) {
+        char *body_out = NULL;
+        if (setjmp(it->on_error) == 0) {
+            Value args[3];
+            args[0] = value_str(myon_strdup(req.method));
+            args[1] = value_str(myon_strdup(req.path));
+            args[2] = value_str(myon_strdup(req.body));
+            Value r = call_function(it, 0, c->handler, args, 3, NULL);
+            if (r.type == TYPE_STR && r.as.obj)
+                body_out = myon_strdup(r.as.obj->as.str);
+            else
+                body_out = myon_strdup("");
+            value_free(&r);
+            for (int i = 0; i < 3; i++) value_free(&args[i]);
+        } else {
+            body_out = myon_strdup("500 Internal Server Error");
+        }
+        size_t rlen = 0;
+        char *resp = http_build_response(200, "OK", "text/plain",
+                                         body_out, strlen(body_out), &rlen);
+        if (resp) { http_send_all(it, c->st, c->conn_id, resp, rlen); free(resp); }
+        free(body_out);
+        http_request_free(&req);
+    }
+
+    memcpy(&it->on_error, &saved, sizeof(jmp_buf));
+    it->current_task = prev;
+
+    net_close(c->st, c->conn_id);
+    value_free(&c->handler);
+
+    /* mark this task done (no meaningful result) */
+    event_loop_task_set_result(c->task, NULL, 0);
+    free(c);
+}
+
+/* --- context/entry for the accept loop, run as its own coroutine --- */
+typedef struct {
+    Interp  *it;
+    NetState *st;
+    int      lsock;
+    int      has_handler;
+    Value    handler;    /* owned TYPE_FUNC copy (nil for serve_static) */
+    char    *root_dir;   /* owned copy (for serve_static)               */
+    Task    *task;
+} HttpServerCtx;
+
+/* The accept loop itself.  Runs as a coroutine so it cooperatively yields to
+ * the event loop (and to per-connection handler tasks) between accepts. */
+static void http_accept_loop_entry(void *ud) {
+    HttpServerCtx *sc = (HttpServerCtx *)ud;
+    Interp *it = sc->it;
+    NetState *st = sc->st;
+
+    Task *prev = it->current_task;
+    it->current_task = sc->task;
+
+    int lfd = net_raw_fd(st, sc->lsock);
+    for (;;) {
+        char *peer = NULL, *aerr = NULL;
+        int cid = net_try_accept(st, sc->lsock, &peer, &aerr);
+        free(peer);
+        if (cid == -2) { free(aerr); net_wait_fd(it, lfd, 0); continue; }
+        if (cid < 0)   { free(aerr); break; } /* fatal accept error */
+
+        if (sc->has_handler) {
+            HttpConnCtx *c = (HttpConnCtx *)myon_xmalloc(sizeof(HttpConnCtx));
+            c->it = it; c->st = st; c->conn_id = cid;
+            c->handler = value_copy(&sc->handler);
+            c->task = NULL;
+            Task *t = event_loop_spawn(ensure_loop(it), http_conn_task_entry, c);
+            c->task = t;
+        } else {
+            /* static file serving is quick; handle inline on this coroutine */
+            http_serve_static_conn(it, st, cid, sc->root_dir);
+        }
+    }
+
+    it->current_task = prev;
+    net_close(st, sc->lsock);
+    value_free(&sc->handler);
+    free(sc->root_dir);
+    event_loop_task_set_result(sc->task, NULL, 0);
+    free(sc);
+}
+
+/* Set up the listening socket then run the accept loop as a coroutine.
+ * Blocks the script forever, like `python -m http.server` (Ctrl+C to stop).
+ * `handler` is nil for serve_static. */
+static Value http_run_server(Interp *it, int line, int port,
+                             const char *root_dir, Value handler) {
+    NetState *st = ensure_net(it);
+    if (!net_supported())
+        return make_result_pair(value_bool(0),
+            value_error(myon_strdup("myon.http unsupported on this platform")));
+
+    char *err = NULL;
+    int lsock = net_socket_create(st, 0, &err);
+    if (lsock < 0)
+        return make_result_pair(value_bool(0),
+            value_error(err ? err : myon_strdup("socket failed")));
+    if (net_bind(st, lsock, "0.0.0.0", port, &err) != 0) {
+        net_close(st, lsock);
+        return make_result_pair(value_bool(0),
+            value_error(err ? err : myon_strdup("bind failed")));
+    }
+    if (net_listen(st, lsock, 64, &err) != 0) {
+        net_close(st, lsock);
+        return make_result_pair(value_bool(0),
+            value_error(err ? err : myon_strdup("listen failed")));
+    }
+
+    /* Spawn the accept loop as a coroutine so per-connection handler tasks
+     * get scheduled fairly alongside it (regardless of whether serve* was
+     * called from the top level or inside another async task). */
+    HttpServerCtx *sc = (HttpServerCtx *)myon_xmalloc(sizeof(HttpServerCtx));
+    sc->it = it; sc->st = st; sc->lsock = lsock;
+    sc->has_handler = (handler.type == TYPE_FUNC);
+    sc->handler = sc->has_handler ? value_copy(&handler) : value_nil();
+    sc->root_dir = myon_strdup(root_dir ? root_dir : ".");
+    sc->task = NULL;
+    Task *server_task = event_loop_spawn(ensure_loop(it),
+                                         http_accept_loop_entry, sc);
+    sc->task = server_task;
+
+    if (it->current_task) {
+        /* Inside another coroutine (e.g. a test that also runs a client task):
+         * the server is background work.  Mark it a daemon so it does not keep
+         * the program alive once the foreground tasks finish, and yield to the
+         * loop so it and its connection tasks make progress while we are
+         * "blocked" here.  Control returns if the accept loop ever ends. */
+        event_loop_set_daemon(server_task, 1);
+        /* The task that is blocked serving (this coroutine) is likewise
+         * background work — mark it a daemon too so awaiting the endless
+         * accept loop does not count as foreground and hang program exit. */
+        event_loop_set_daemon(it->current_task, 1);
+        event_loop_wait_task(it->loop, server_task);
+    } else {
+        /* Top level: this is the whole program's purpose (like
+         * `python -m http.server`).  Drive the loop forever; Ctrl+C exits. */
+        event_loop_run_until_all_done(it->loop);
+    }
+
+    (void)line;
+    return make_result_pair(value_bool(1), value_nil());
+}
+
+/* --- minimal self-contained HTTP client over raw TCP (no TLS) --- */
+
+/* Parse "http://host[:port]/path" -> host/port/path (all malloc'd out).
+ * Returns 0 on success, -1 on malformed/unsupported (e.g. https). */
+static int http_parse_url(const char *url, char **host_out, int *port_out,
+                          char **path_out, char **err_out) {
+    if (strncmp(url, "https://", 8) == 0) {
+        if (err_out) *err_out = myon_strdup("https:// (TLS) is not supported by myon.http");
+        return -1;
+    }
+    const char *p = url;
+    if (strncmp(p, "http://", 7) == 0) p += 7;
+    /* host[:port] up to '/' or end */
+    const char *slash = strchr(p, '/');
+    const char *hostend = slash ? slash : p + strlen(p);
+    const char *colon = memchr(p, ':', (size_t)(hostend - p));
+    int port = 80;
+    size_t hlen;
+    if (colon) {
+        hlen = (size_t)(colon - p);
+        port = (int)strtol(colon + 1, NULL, 10);
+        if (port <= 0) port = 80;
+    } else {
+        hlen = (size_t)(hostend - p);
+    }
+    if (hlen == 0) { if (err_out) *err_out = myon_strdup("invalid URL: missing host"); return -1; }
+    char *host = (char *)myon_xmalloc(hlen + 1);
+    memcpy(host, p, hlen); host[hlen] = '\0';
+    char *path = myon_strdup(slash ? slash : "/");
+    *host_out = host; *port_out = port; *path_out = path;
+    return 0;
+}
+
+/* Perform one HTTP/1.0 request; returns (body, status, error) as a 3-tuple.
+ * `method` is "GET" or "POST"; body/content_type may be NULL for GET. */
+static Value http_client_request(Interp *it, int line, const char *url,
+                                 const char *method, const char *body,
+                                 const char *content_type) {
+    (void)line;
+    Value tup = value_array(NULL);
+    char *host = NULL, *path = NULL, *perr = NULL; int port = 80;
+    if (http_parse_url(url, &host, &port, &path, &perr) != 0) {
+        array_push(&tup, value_str(myon_strdup("")));
+        array_push(&tup, value_int(0));
+        array_push(&tup, value_error(perr ? perr : myon_strdup("bad URL")));
+        return tup;
+    }
+
+    NetState *st = ensure_net(it);
+    char *err = NULL;
+    int sock = net_socket_create(st, 0, &err);
+    if (sock < 0) {
+        array_push(&tup, value_str(myon_strdup("")));
+        array_push(&tup, value_int(0));
+        array_push(&tup, value_error(err ? err : myon_strdup("socket failed")));
+        free(host); free(path);
+        return tup;
+    }
+    int fd = net_raw_fd(st, sock);
+
+    /* connect (non-blocking, yield/loop until complete) */
+    int rc = net_connect(st, sock, host, port, &err);
+    while (rc == -2) { net_wait_fd(it, fd, 1); free(err); err = NULL; rc = net_connect_check(st, sock, &err); }
+    if (rc != 0) {
+        array_push(&tup, value_str(myon_strdup("")));
+        array_push(&tup, value_int(0));
+        array_push(&tup, value_error(err ? err : myon_strdup("connect failed")));
+        net_close(st, sock); free(host); free(path);
+        return tup;
+    }
+
+    /* build request */
+    size_t blen = body ? strlen(body) : 0;
+    char head[1024];
+    int hn;
+    if (blen)
+        hn = snprintf(head, sizeof(head),
+            "%s %s HTTP/1.0\r\nHost: %s\r\nContent-Type: %s\r\n"
+            "Content-Length: %zu\r\nConnection: close\r\n\r\n",
+            method, path, host, content_type ? content_type : "application/octet-stream", blen);
+    else
+        hn = snprintf(head, sizeof(head),
+            "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
+            method, path, host);
+    http_send_all(it, st, sock, head, (size_t)hn);
+    if (blen) http_send_all(it, st, sock, body, blen);
+
+    /* read the whole response */
+    size_t cap = 8192, len = 0;
+    char *rbuf = (char *)myon_xmalloc(cap);
+    for (;;) {
+        if (len == cap) { cap *= 2; rbuf = (char *)myon_xrealloc(rbuf, cap); }
+        char *rerr = NULL;
+        long long n = net_recv(st, sock, rbuf + len, (long long)(cap - len), &rerr);
+        if (n == -2) { free(rerr); net_wait_fd(it, fd, 0); continue; }
+        if (n <= 0)  { free(rerr); break; } /* 0 == EOF/close */
+        len += (size_t)n;
+    }
+    net_close(st, sock);
+    free(host); free(path);
+
+    /* split status line / headers / body */
+    int status = 0;
+    if (len >= 12 && strncmp(rbuf, "HTTP/", 5) == 0) {
+        const char *sp = memchr(rbuf, ' ', len);
+        if (sp) status = (int)strtol(sp + 1, NULL, 10);
+    }
+    size_t hend = http_find_header_end(rbuf, len);
+    const char *bodyp = rbuf + hend;
+    size_t bodylen = hend <= len ? len - hend : 0;
+
+    array_push(&tup, value_str(myon_strndup(bodyp, bodylen)));
+    array_push(&tup, value_int(status));
+    array_push(&tup, value_nil());
+    free(rbuf);
+    return tup;
+}
+
+static int call_http(Interp *it, Env *env, const char *name, Expr *call, Value *out) {
+    int line = call->line;
+
+    if (strcmp(name, "myon.http.serve_static") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
+        int port = (int)a.as.i;
+        char *root = (b.type == TYPE_STR && b.as.obj) ? myon_strdup(b.as.obj->as.str)
+                                                      : myon_strdup(".");
+        value_free(&a); value_free(&b);
+        *out = http_run_server(it, line, port, root, value_nil());
+        free(root);
+        return 1;
+    }
+
+    if (strcmp(name, "myon.http.serve") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
+        int port = (int)a.as.i;
+        if (b.type != TYPE_FUNC) {
+            value_free(&a); value_free(&b);
+            runtime_error(it, line, "myon.http.serve: second argument must be a function");
+        }
+        *out = http_run_server(it, line, port, ".", b);
+        value_free(&a); value_free(&b);
+        return 1;
+    }
+
+    if (strcmp(name, "myon.http.get") == 0) {
+        Value a = eval_arg(it, env, call, 0);
+        const char *url = (a.type == TYPE_STR && a.as.obj) ? a.as.obj->as.str : "";
+        *out = http_client_request(it, line, url, "GET", NULL, NULL);
+        value_free(&a);
+        return 1;
+    }
+
+    if (strcmp(name, "myon.http.post") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1),
+              c = eval_arg(it, env, call, 2);
+        const char *url  = (a.type == TYPE_STR && a.as.obj) ? a.as.obj->as.str : "";
+        const char *body = (b.type == TYPE_STR && b.as.obj) ? b.as.obj->as.str : "";
+        const char *ct   = (c.type == TYPE_STR && c.as.obj) ? c.as.obj->as.str : "application/octet-stream";
+        *out = http_client_request(it, line, url, "POST", body, ct);
+        value_free(&a); value_free(&b); value_free(&c);
+        return 1;
+    }
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Phase4.1, Step4: C-to-Myon callback slots                           */
 /*                                                                     */
 /* ffi_callback.c hands out static trampoline function pointers keyed  */
@@ -2776,7 +3604,14 @@ static Value eval_call(Interp *it, Env *env, Expr *e) {
         Value *args = argc ? (Value *)myon_xmalloc(sizeof(Value) * argc) : NULL;
         for (int i = 0; i < argc; i++)
             args[i] = eval_expr(it, env, e->as.call.args[i]);
-        Value r = call_function(it, line, fn, args, argc, e->as.call.arg_names);
+        /* Phase5: `myon.async myon.func` values do not run inline — spawn a
+         * coroutine task and hand back a TYPE_TASK handle immediately. */
+        Value r;
+        if (fn.as.obj->as.fn.decl && fn.as.obj->as.fn.decl->is_async) {
+            r = spawn_async_task(it, fn, args, argc);
+        } else {
+            r = call_function(it, line, fn, args, argc, e->as.call.arg_names);
+        }
         for (int i = 0; i < argc; i++) value_free(&args[i]);
         free(args);
         value_free(&fn);
@@ -2830,8 +3665,18 @@ static Value eval_expr(Interp *it, Env *env, Expr *e) {
             return value_func(e->as.lambda, env);
 
         case EXPR_AWAIT: {
-            /* pseudo-async: await simply evaluates the (already-run) value */
-            return eval_expr(it, env, e->as.operand);
+            /* Phase5: if the operand is (or evaluates to) an async task, wait
+             * for it cooperatively and yield its result.  Otherwise this is a
+             * plain value (e.g. `myon.await` on a non-async call) — keep the
+             * historical pseudo-async behaviour of returning it as-is so
+             * pre-Phase5 code still works. */
+            Value v = eval_expr(it, env, e->as.operand);
+            if (v.type == TYPE_TASK) {
+                Value r = await_task(it, e->line, v);
+                value_free(&v);
+                return r;
+            }
+            return v;
         }
 
         case EXPR_GENERIC: {
@@ -3277,7 +4122,7 @@ static Flow exec_block(Interp *it, Env *env, StmtList *body) {
 
 static const char *BUILTIN_MODULES[] = {
     "myon.stdio", "myon.math", "myon.string", "myon.ffi",
-    "myon.time", "myon.random", NULL
+    "myon.time", "myon.random", "myon.net", "myon.http", NULL
 };
 
 static int is_builtin_module(const char *path) {
@@ -3436,6 +4281,8 @@ Interp *interp_create(void) {
 void interp_free(Interp *it) {
     if (!it) return;
     ffi_callback_reset_all(); /* drop any live FFI callback slots (Phase4.1) */
+    if (it->net) net_state_destroy(it->net);
+    if (it->loop) event_loop_destroy(it->loop);
     env_free(it->global);
     free(it->structs.items);
     if (it->ffi) ffi_state_free(it->ffi);
@@ -3478,6 +4325,15 @@ static int run_toplevel(Interp *it, Program *program) {
             it->ret_values = NULL; it->ret_count = 0;
         }
     }
+
+    /* Phase5: drain any async tasks that were spawned but never awaited so
+     * their side effects (prints, I/O) run to completion before we exit —
+     * matching asyncio's "run until complete" at program end.  Daemon tasks
+     * (e.g. an HTTP server accept loop) are ignored here so a script whose
+     * foreground work is done can exit even though a server is still pending.
+     * Any pending task result values are reclaimed by event_loop_destroy(). */
+    if (it->loop)
+        event_loop_run_until_foreground_done(it->loop);
     return 0;
 }
 
@@ -3507,6 +4363,8 @@ int interpret(Program *program) {
     }
 
     ffi_callback_reset_all(); /* drop any live FFI callback slots (Phase4.1) */
+    if (it.net) net_state_destroy(it.net);
+    if (it.loop) event_loop_destroy(it.loop);
     env_free(it.global);
     free(it.structs.items);
     if (it.ffi) ffi_state_free(it.ffi);

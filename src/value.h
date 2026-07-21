@@ -54,7 +54,8 @@ typedef enum {
     OBJ_ARRAY,
     OBJ_MAP,
     OBJ_STRUCT,   /* struct instance */
-    OBJ_FUNC      /* function / lambda / bound method */
+    OBJ_FUNC,     /* function / lambda / bound method */
+    OBJ_TASK      /* Phase5: async task handle (wraps event-loop Task*) */
 } ObjKind;
 
 /* dynamic array of values */
@@ -100,6 +101,13 @@ typedef struct {
     Value           *bound_self;
 } FuncData;
 
+/* async task handle (Phase5): opaque pointer into the event loop.  The
+ * event-loop Task itself is owned by the loop (freed on loop destroy); this
+ * object only holds a borrowed handle used by myon.await. */
+typedef struct {
+    void *task;   /* event-loop `Task *` (opaque here to keep layering clean) */
+} TaskData;
+
 struct Obj {
     ObjKind kind;
     int     refcount;
@@ -109,6 +117,7 @@ struct Obj {
         MapData     map;
         StructData  st;
         FuncData    fn;
+        TaskData    task;  /* OBJ_TASK */
     } as;
 };
 
@@ -129,6 +138,7 @@ Value value_array(TypeSpec *elem_type /*owned*/);
 Value value_map(TypeSpec *key_type /*owned*/, TypeSpec *val_type /*owned*/);
 Value value_struct(const char *type_name, struct StructDecl *decl);
 Value value_func(struct FuncDecl *decl, struct Env *closure);
+Value value_task(void *task /* borrowed event-loop Task* */);
 
 /* ---- refcount management ---- */
 Value value_copy(const Value *v);   /* shares objects, bumps refcount */

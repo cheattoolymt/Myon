@@ -103,6 +103,12 @@ Value value_func(FuncDecl *decl, Env *closure) {
     return obj_value(TYPE_FUNC, o);
 }
 
+Value value_task(void *task) {
+    Obj *o = obj_new(OBJ_TASK);
+    o->as.task.task = task;
+    return obj_value(TYPE_TASK, o);
+}
+
 /* ------------------------------------------------------------------ */
 /* Reference counting                                                  */
 /* ------------------------------------------------------------------ */
@@ -111,6 +117,7 @@ static int is_obj(const Value *v) {
     switch (v->type) {
         case TYPE_STR: case TYPE_CHAR: case TYPE_ERROR:
         case TYPE_ARRAY: case TYPE_MAP: case TYPE_STRUCT: case TYPE_FUNC:
+        case TYPE_TASK:
             return 1;
         default: return 0;
     }
@@ -168,6 +175,9 @@ static void obj_free(Obj *o) {
                 free(o->as.fn.bound_self);
             }
             /* decl and closure are not owned by the function value */
+            break;
+        case OBJ_TASK:
+            /* the event-loop Task is owned by the loop, not by this handle */
             break;
     }
     free(o);
@@ -262,6 +272,8 @@ char *value_to_cstr(const Value *v) {
         }
         case TYPE_FUNC:
             return myon_strdup("<func>");
+        case TYPE_TASK:
+            return myon_strdup("<task>");
         default:
             return myon_strdup("");
     }
