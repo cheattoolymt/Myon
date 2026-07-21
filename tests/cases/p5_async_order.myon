@@ -1,0 +1,36 @@
+# Phase5 Step7: cooperative event loop ordering.
+# Three myon.async tasks are spawned in the order slow -> mid -> fast, but each
+# awaits a myon.time.sleep_ms of a different length. Because the tasks run
+# concurrently on the single-threaded event loop, they finish in ascending
+# sleep order (fast, mid, slow) regardless of spawn order. This is the visible
+# difference from the old "pseudo-async" model, where output would have matched
+# spawn order.
+module myon.stdio
+module myon.time
+
+myon.async myon.func slow() ret int {
+    myon.await myon.time.sleep_ms(90)
+    myon.print(str("slow"))
+    ret 3
+}
+myon.async myon.func mid() ret int {
+    myon.await myon.time.sleep_ms(50)
+    myon.print(str("mid"))
+    ret 2
+}
+myon.async myon.func fast() ret int {
+    myon.await myon.time.sleep_ms(10)
+    myon.print(str("fast"))
+    ret 1
+}
+
+# Spawn in slow -> mid -> fast order (returns Task values immediately).
+t1 = slow()
+t2 = mid()
+t3 = fast()
+
+# Await all; the prints above already happened in completion order.
+myon.await t1
+myon.await t2
+myon.await t3
+myon.print(str("all done"))

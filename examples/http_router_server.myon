@@ -1,0 +1,38 @@
+# Phase5 HTTP demo: a tiny routing server built on myon.http.serve.
+#
+# Unlike serve_static (which just returns files), myon.http.serve calls a Myon
+# handler function for every request and sends back whatever string it returns.
+# The handler signature is fixed:  (method: str, path: str, body: str) ret str.
+# Responses are always 200 OK / Content-Type: text/plain in this Phase5 version
+# (status/header customization is an Open Question for a future phase), so the
+# "404" below is just a body string, not a real 404 status code.
+#
+# This is a RESIDENT server: control does not return once serve() is called.
+#
+# Run it, then in ANOTHER terminal try:
+#     curl http://localhost:8000/          -> welcome message
+#     curl http://localhost:8000/hello     -> greeting
+#     curl http://localhost:8000/anything  -> "404"-style body
+#
+# Run with:  ./myon examples/http_router_server.myon
+
+module myon.stdio
+module myon.http
+
+myon.func handler(method: str, path: str, body: str) ret str {
+    myon.if path == "/" then {
+        ret str("Welcome to the Myon HTTP router demo!")
+    }
+    myon.if path == "/hello" then {
+        ret str("Hello, Myon!")
+    }
+    # Any other path: a 404-style body (still sent with a 200 status in Phase5).
+    ret str("404 Not Found: " + path)
+}
+
+myon.print(str("Routing server on http://localhost:8000/  (Ctrl+C to stop)"))
+
+ok, err = myon.http.serve(8000, handler)
+myon.if err != myon.nil then {
+    myon.print(str("server error"))
+}

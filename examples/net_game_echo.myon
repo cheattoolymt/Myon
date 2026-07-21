@@ -1,0 +1,50 @@
+# Phase5 net demo: a minimal 1-to-1 UDP "game" echo.
+#
+# This models the simplest possible game-networking shape: a client sends a
+# coordinate-like datagram ("x=..,y=..") and the server echoes it straight back
+# to whoever sent it.  Both the server and the client run as myon.async tasks in
+# ONE process on the cooperative event loop, so this example is self-contained
+# and needs no second terminal — run it and it prints what the client got back.
+#
+# NOTE: this is deliberately 1-to-1.  Real broadcast, multiple-client tracking,
+# reliability, and tick loops are out of scope for Phase5; a proper game server
+# design is left for a future phase.  It is here to show that myon.net UDP works
+# and that many tasks can share the single event loop.
+#
+# Run with:  ./myon examples/net_game_echo.myon
+
+module myon.stdio
+module myon.net
+module myon.string
+
+# Server socket on an OS-chosen free port (bind to port 0, read it back).
+srv, e1 = myon.net.udp_socket()
+myon.net.bind(srv, "127.0.0.1", 0)
+sport, ep = myon.net.local_port(srv)
+
+myon.async myon.func server() ret int {
+    # recv_from also tells us the sender "host:port"; echo the payload back there.
+    data, from, e2 = myon.net.recv_from(srv, 1024)
+    parts = myon.string.split(from, ":")
+    host = parts[0]
+    port, pe = myon.string.to_int(parts[1])
+    myon.print(str("server got: " + data + "  from " + from))
+    myon.net.send_to(srv, data, host, port)
+    ret 0
+}
+
+myon.async myon.func client() ret str {
+    cli, ce = myon.net.udp_socket()
+    myon.net.bind(cli, "127.0.0.1", 0)
+    myon.net.send_to(cli, str("x=10,y=20"), "127.0.0.1", sport)
+    reply, rfrom, re = myon.net.recv_from(cli, 1024)
+    myon.net.close(cli)
+    ret reply
+}
+
+ts = server()
+tc = client()
+got = myon.await tc
+myon.await ts
+myon.net.close(srv)
+myon.print(str("client got echo: " + got))

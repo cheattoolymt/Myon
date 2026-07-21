@@ -3,3 +3,7 @@
 /myon
 *.o
 tests/fixtures/libffi_callback_test.so
+
+# Core dumps
+core
+core.*
