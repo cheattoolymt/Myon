@@ -1,0 +1,748 @@
+# Snake game written in Myon, rendered via SDL2 through the FFI layer.
+#
+# Controls: Arrow keys to steer. ESC or window-close to quit.
+# Rules: eat the red food to grow and score points. No time limit —
+#        the game only ends when you run into your own tail (or you quit).
+# Requires SDL2 (libSDL2-2.0.so.0) and a display.
+#
+# Run with:  ./myon examples/snake2.myon
+
+module myon.ffi
+module myon.stdio
+module myon.math
+module myon.string
+module myon.random
+module myon.time
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+CELL = 20
+COLS = 32
+ROWS = 24
+WIN_W = 640
+WIN_H = 480
+
+SDL_INIT_VIDEO = 32
+SDL_WINDOWPOS_UNDEFINED = 536805376
+SDL_WINDOW_SHOWN = 4
+
+SDL_QUIT = 256
+SDL_KEYDOWN = 768
+
+# Scancodes (SDL_SCANCODE_*)
+SC_UP = 82
+SC_DOWN = 81
+SC_LEFT = 80
+SC_RIGHT = 79
+SC_ESCAPE = 41
+
+TWO32 = 4294967296
+
+# Frame pacing: the render loop runs much faster than the logical grid
+# tick so the snake can be interpolated smoothly between grid cells.
+FRAME_MS = 16
+
+# How long (in ms) the "just ate" flash / score pop effect lasts.
+EAT_FLASH_MS = 220
+
+# ---------------------------------------------------------------------------
+# Struct layout for SDL_Rect (used every frame to draw cells / HUD segments)
+# ---------------------------------------------------------------------------
+rect_fields = myon.array(str)
+rect_fields.push(str("i32"))
+rect_fields.push(str("i32"))
+rect_fields.push(str("i32"))
+rect_fields.push(str("i32"))
+rect_size, rderr = myon.ffi.struct_def(str("Cell"), rect_fields)
+
+# Draws a filled rect at raw pixel coordinates (no grid snapping).
+myon.func draw_rect_px(handle: int, renderer: int, px: int, py: int, w: int, h: int) ret void {
+    rect, e = myon.ffi.struct_alloc(str("Cell"))
+    myon.ffi.struct_write(rect, str("Cell"), 0, px)
+    myon.ffi.struct_write(rect, str("Cell"), 1, py)
+    myon.ffi.struct_write(rect, str("Cell"), 2, w)
+    myon.ffi.struct_write(rect, str("Cell"), 3, h)
+    myon.ffi.call_i(handle, str("SDL_RenderFillRect"), str("pb"), renderer, rect)
+    myon.ffi.free(rect)
+}
+
+# Draws a filled cell inset by `pad` pixels on every side (pad=0 for a full
+# tile, pad>0 to leave a visible grid gap between cells). Operates on grid
+# coordinates given in *interpolated pixel space* (gx_px, gy_px already
+# multiplied out), so both the snake (interpolated) and food (grid-aligned)
+# can share this helper.
+myon.func draw_inset_px(handle: int, renderer: int, px: int, py: int, pad: int) ret void {
+    draw_rect_px(handle, renderer, px + pad, py + pad, CELL - pad * 2, CELL - pad * 2)
+}
+
+# Read a little-endian uint32 field out of a byte offset within a block,
+# masked down to 32 bits (read_i64 reads 8 bytes, so we fold the high half
+# away with mod()).
+myon.func read_u32(block: int, offset: int) ret int {
+    raw, e = myon.ffi.read_i64(block, offset)
+    v, verr = myon.math.mod(raw, TWO32)
+    ret v
+}
+
+# ---------------------------------------------------------------------------
+# Integer-only helpers: linear interpolation and a triangle (pulse) wave.
+# No float() cast exists in Myon, so everything below stays in int math.
+# ---------------------------------------------------------------------------
+
+# Linear interpolation from `from` to `to`, t1000 in [0, 1000].
+myon.func lerp_i(from: int, to: int, t1000: int) ret int {
+    diff = to - from
+    ret from + (diff * t1000) / 1000
+}
+
+# Ease-out quad on [0,1000] -> [0,1000]: fast start, gentle settle.
+# f(t) = 1 - (1-t)^2, done in integer 0..1000 fixed point.
+myon.func ease_out_quad(t1000: int) ret int {
+    inv = 1000 - t1000
+    ret 1000 - (inv * inv) / 1000
+}
+
+# Smoothstep on [0,1000] -> [0,1000]: f(t) = 3t^2 - 2t^3. Used to round off
+# the sharp corners of a plain linear ramp so motion doesn't look mechanical.
+myon.func smoothstep1000(t1000: int) ret int {
+    t2 = (t1000 * t1000) / 1000
+    t3 = (t2 * t1000) / 1000
+    ret 3 * t2 - 2 * t3
+}
+
+# Smooth (sine-like) pulse: 0 -> amp -> 0 over period_ms, evaluated at `ms`,
+# using a smoothstep-shaped ramp on each half instead of a linear triangle
+# wave so the breathing motion has no sharp corners.
+myon.func smooth_pulse(ms: int, period_ms: int, amp: int) ret int {
+    ph, phe = myon.math.mod(ms, period_ms)
+    half = period_ms / 2
+    t1000 = 0
+    myon.if ph < half then {
+        t1000 = (ph * 1000) / half
+    } myon.else {
+        t1000 = 1000 - ((ph - half) * 1000) / half
+    }
+    smoothed = smoothstep1000(t1000)
+    ret (smoothed * amp) / 1000
+}
+
+# Overshoot-then-settle curve used for the score "pop": rises quickly past
+# 100% up to (1000+max_extra), then eases back down to 1000 over the rest
+# of the window. t1000 is progress through the whole effect, 0=just
+# triggered, 1000=fully faded back to rest.
+myon.func pop_scale(t1000: int, max_extra: int) ret int {
+    myon.if t1000 < 300 then {
+        local_t = (t1000 * 1000) / 300
+        eased = ease_out_quad(local_t)
+        ret 1000 + (eased * max_extra) / 1000
+    } myon.else {
+        local_t = ((t1000 - 300) * 1000) / 700
+        eased = ease_out_quad(local_t)
+        ret 1000 + max_extra - (eased * max_extra) / 1000
+    }
+}
+
+# Per-segment "slither" wobble: each body segment gets a smoothstep-shaped
+# wave with its phase offset by its position along the body, so the snake
+# ripples like it's actually undulating instead of every segment moving in
+# lockstep. Returns a perpendicular-ish nudge in px, centered on 0.
+myon.func segment_wave(seg_index: int, ms: int, period_ms: int, amp: int) ret int {
+    phase_shift = (seg_index * period_ms) / 6
+    t, terr = myon.math.mod(ms + phase_shift, period_ms)
+    half = period_ms / 2
+    t1000 = 0
+    myon.if t < half then {
+        t1000 = (t * 1000) / half
+    } myon.else {
+        t1000 = 1000 - ((t - half) * 1000) / half
+    }
+    s = smoothstep1000(t1000)
+    ret (s * amp * 2) / 1000 - amp
+}
+
+# Tongue flick: mostly retracted (length 0), briefly darts out to max_len
+# and back near the start of every period_ms window.
+myon.func tongue_extend(ms: int, period_ms: int, max_len: int) ret int {
+    t, terr = myon.math.mod(ms, period_ms)
+    flick_dur = period_ms / 5
+    myon.if t > flick_dur then {
+        ret 0
+    }
+    half = flick_dur / 2
+    myon.if t < half then {
+        ret (t * max_len) / half
+    } myon.else {
+        t2 = t - half
+        ret max_len - (t2 * max_len) / half
+    }
+}
+
+# Perpendicular axis of a (dx,dy) grid direction, used to apply the slither
+# wobble sideways relative to travel instead of along it. Only handles the
+# four cardinal directions the snake actually moves in; (0,0) (not moving,
+# e.g. before the first tick) falls back to a horizontal wobble.
+myon.func perp_x(dx: int, dy: int) ret int {
+    myon.if dy != 0 then { ret 1 }
+    ret 0
+}
+myon.func perp_y(dx: int, dy: int) ret int {
+    myon.if dy != 0 then { ret 0 }
+    ret 1
+}
+
+# ---------------------------------------------------------------------------
+# 7-segment digit rendering (matrix/"digital" style numerals), built purely
+# from filled rects so the score can be drawn inside the game view instead
+# of relying on the OS window title bar.
+#
+# Segment layout (classic 7-seg letters):
+#   aaa
+#  f   b
+#  f   b
+#   ggg
+#  e   c
+#  e   c
+#   ddd
+#
+# seg_pattern(d) returns [a,b,c,d,e,f,g] as 1/0 flags.
+# ---------------------------------------------------------------------------
+myon.func seg_pattern(d: int) ret myon.array(int) {
+    p = myon.array(int)
+    myon.if d == 0 then {
+        p.push(1); p.push(1); p.push(1); p.push(1); p.push(1); p.push(1); p.push(0)
+    } myon.elif d == 1 then {
+        p.push(0); p.push(1); p.push(1); p.push(0); p.push(0); p.push(0); p.push(0)
+    } myon.elif d == 2 then {
+        p.push(1); p.push(1); p.push(0); p.push(1); p.push(1); p.push(0); p.push(1)
+    } myon.elif d == 3 then {
+        p.push(1); p.push(1); p.push(1); p.push(1); p.push(0); p.push(0); p.push(1)
+    } myon.elif d == 4 then {
+        p.push(0); p.push(1); p.push(1); p.push(0); p.push(0); p.push(1); p.push(1)
+    } myon.elif d == 5 then {
+        p.push(1); p.push(0); p.push(1); p.push(1); p.push(0); p.push(1); p.push(1)
+    } myon.elif d == 6 then {
+        p.push(1); p.push(0); p.push(1); p.push(1); p.push(1); p.push(1); p.push(1)
+    } myon.elif d == 7 then {
+        p.push(1); p.push(1); p.push(1); p.push(0); p.push(0); p.push(0); p.push(0)
+    } myon.elif d == 8 then {
+        p.push(1); p.push(1); p.push(1); p.push(1); p.push(1); p.push(1); p.push(1)
+    } myon.else {
+        p.push(1); p.push(1); p.push(1); p.push(1); p.push(1); p.push(1); p.push(1)
+    }
+    ret p
+}
+
+# Splits a non-negative int into its base-10 digits, most significant first.
+# 0 becomes a single-element [0].
+myon.func digits_of(n: int) ret myon.array(int) {
+    ds = myon.array(int)
+    myon.if n == 0 then {
+        ds.push(0)
+        ret ds
+    }
+    v = n
+    tmp = myon.array(int)
+    myon.while v > 0 {
+        r, rerr = myon.math.mod(v, 10)
+        tmp.push(r)
+        v = (v - r) / 10
+    }
+    i = tmp.length() - 1
+    myon.while i >= 0 {
+        ds.push(tmp[i])
+        i = i - 1
+    }
+    ret ds
+}
+
+# Draws one 7-seg digit. (px, py) is the top-left of the digit's bounding
+# box. `thick` is the segment thickness in px, `dlen` the length of the
+# horizontal segments (vertical segments run `dlen` tall on each side).
+myon.func draw_digit(handle: int, renderer: int, px: int, py: int, dlen: int, thick: int, d: int) ret void {
+    pat = seg_pattern(d)
+    # a: top
+    myon.if pat[0] == 1 then {
+        draw_rect_px(handle, renderer, px + thick, py, dlen, thick)
+    }
+    # b: top-right
+    myon.if pat[1] == 1 then {
+        draw_rect_px(handle, renderer, px + thick + dlen, py + thick, thick, dlen)
+    }
+    # c: bottom-right
+    myon.if pat[2] == 1 then {
+        draw_rect_px(handle, renderer, px + thick + dlen, py + thick * 2 + dlen, thick, dlen)
+    }
+    # d: bottom
+    myon.if pat[3] == 1 then {
+        draw_rect_px(handle, renderer, px + thick, py + thick * 2 + dlen * 2, dlen, thick)
+    }
+    # e: bottom-left
+    myon.if pat[4] == 1 then {
+        draw_rect_px(handle, renderer, px, py + thick * 2 + dlen, thick, dlen)
+    }
+    # f: top-left
+    myon.if pat[5] == 1 then {
+        draw_rect_px(handle, renderer, px, py + thick, thick, dlen)
+    }
+    # g: middle
+    myon.if pat[6] == 1 then {
+        draw_rect_px(handle, renderer, px + thick, py + thick + dlen, dlen, thick)
+    }
+}
+
+# Draws a whole non-negative integer as a row of 7-seg digits starting at
+# (px, py). `scale1000` lets the caller grow the digits temporarily (score
+# "pop" effect) without needing float math: 1000 = 100%, 1300 = 130%, etc.
+myon.func draw_number(handle: int, renderer: int, px: int, py: int, n: int, scale1000: int) ret void {
+    dlen = (18 * scale1000) / 1000
+    thick = (5 * scale1000) / 1000
+    gap = (8 * scale1000) / 1000
+    digit_w = thick * 2 + dlen + gap
+
+    ds = digits_of(n)
+    i = 0
+    cnt = ds.length()
+    myon.while i < cnt {
+        draw_digit(handle, renderer, px + i * digit_w, py, dlen, thick, ds[i])
+        i = i + 1
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Snake state: body is an array of "gx*1000+gy" packed cells (front = head).
+# ---------------------------------------------------------------------------
+body = myon.array(int)
+body.push(16 * 1000 + 12)
+body.push(15 * 1000 + 12)
+body.push(14 * 1000 + 12)
+
+# Snapshot of the body from the previous logical tick, used purely for
+# rendering interpolation. Same packing as `body`.
+prev_body = myon.array(int)
+prev_body.push(16 * 1000 + 12)
+prev_body.push(15 * 1000 + 12)
+prev_body.push(14 * 1000 + 12)
+
+dir_x = 1
+dir_y = 0
+next_dir_x = 1
+next_dir_y = 0
+
+myon.random.seed(myon.time.now())
+food_x, fe1 = myon.random.int(0, COLS - 1)
+food_y, fe2 = myon.random.int(0, ROWS - 1)
+
+score = 0
+alive = true
+tick_ms = 120
+game_over_reason = str("")
+
+# Timestamp (ms) of the last logical tick and how long the *upcoming* tick
+# is expected to take (== tick_ms at the moment the tick started), used to
+# compute the interpolation ratio for rendering between ticks.
+last_tick_ms = myon.time.now_ms()
+
+# Countdown (ms) for the brief "just ate" flash / score pop effect.
+eat_flash_remaining = 0
+
+# ---------------------------------------------------------------------------
+# SDL setup
+# ---------------------------------------------------------------------------
+handle, err = myon.ffi.load(str("libSDL2-2.0.so.0"))
+myon.if err != myon.nil then {
+    myon.print(str("SDL2 not available; cannot run graphical snake demo"))
+} myon.else {
+    myon.ffi.call_i(handle, str("SDL_Init"), str("i"), SDL_INIT_VIDEO)
+
+    win, we = myon.ffi.call_p(handle, str("SDL_CreateWindow"), str("siiiii"),
+        str("Myon Snake"), SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+        WIN_W, WIN_H, SDL_WINDOW_SHOWN)
+
+    # Make sure the window actually has input focus, otherwise keydown
+    # events never arrive at this process (common gotcha with some WMs).
+    myon.ffi.call_v(handle, str("SDL_RaiseWindow"), str("p"), win)
+
+    renderer, re = myon.ffi.call_p(handle, str("SDL_CreateRenderer"),
+        str("pii"), win, 0 - 1, 0)
+    myon.ffi.call_i(handle, str("SDL_SetRenderDrawBlendMode"), str("pi"), renderer, 1)
+
+    evblock, evalloc_err = myon.ffi.alloc(64)
+
+    myon.ffi.call_v(handle, str("SDL_SetWindowTitle"), str("ps"), win, str("Myon Snake"))
+
+    myon.while alive {
+        frame_start_ms = myon.time.now_ms()
+
+        # --- input -----------------------------------------------------------
+        polling = true
+        myon.while polling {
+            got, perr = myon.ffi.call_i(handle, str("SDL_PollEvent"), str("b"), evblock)
+            myon.if got == 0 then {
+                polling = false
+            } myon.else {
+                etype = read_u32(evblock, 0)
+                myon.if etype == SDL_QUIT then {
+                    alive = false
+                    game_over_reason = str("Window closed")
+                    polling = false
+                } myon.elif etype == SDL_KEYDOWN then {
+                    scancode = read_u32(evblock, 16)
+                    myon.if scancode == SC_UP myon.and dir_y == 0 then {
+                        next_dir_x = 0
+                        next_dir_y = 0 - 1
+                    } myon.elif scancode == SC_DOWN myon.and dir_y == 0 then {
+                        next_dir_x = 0
+                        next_dir_y = 1
+                    } myon.elif scancode == SC_LEFT myon.and dir_x == 0 then {
+                        next_dir_x = 0 - 1
+                        next_dir_y = 0
+                    } myon.elif scancode == SC_RIGHT myon.and dir_x == 0 then {
+                        next_dir_x = 1
+                        next_dir_y = 0
+                    } myon.elif scancode == SC_ESCAPE then {
+                        alive = false
+                        game_over_reason = str("Quit")
+                        polling = false
+                    }
+                }
+            }
+        }
+
+        # --- logical tick (grid movement) -------------------------------------
+        # Only advances the simulation once every `tick_ms`; every other
+        # frame in between only re-renders using the interpolated position.
+        since_tick = frame_start_ms - last_tick_ms
+        myon.if since_tick >= tick_ms myon.and alive then {
+            last_tick_ms = frame_start_ms
+
+            # snapshot current body as the interpolation start point for
+            # the tick we're about to compute
+            prev_snapshot = myon.array(int)
+            pi = 0
+            pn = body.length()
+            myon.while pi < pn {
+                prev_snapshot.push(body[pi])
+                pi = pi + 1
+            }
+
+            dir_x = next_dir_x
+            dir_y = next_dir_y
+
+            head = body[0]
+            # cells are packed as gx*1000+gy
+            hy, hye = myon.math.mod(head, 1000)
+            hx = (head - hy) / 1000
+
+            nx = hx + dir_x
+            ny = hy + dir_y
+
+            # wrap around the edges instead of dying, keeps it forgiving/fun
+            wnx, wnxe = myon.math.mod(nx + COLS, COLS)
+            wny, wnye = myon.math.mod(ny + ROWS, ROWS)
+
+            new_head = wnx * 1000 + wny
+
+            myon.if body.contains(new_head) then {
+                alive = false
+                game_over_reason = str("Hit your own tail!")
+            } myon.else {
+                body.push(new_head)
+                # move the new head to the front by rebuilding (small board, fine)
+                reordered = myon.array(int)
+                reordered.push(new_head)
+                i = 0
+                n = body.length()
+                myon.while i < n - 1 {
+                    reordered.push(body[i])
+                    i = i + 1
+                }
+                body = reordered
+
+                myon.if wnx == food_x myon.and wny == food_y then {
+                    score = score + 1
+                    eat_flash_remaining = EAT_FLASH_MS
+                    fx2, fxe2 = myon.random.int(0, COLS - 1)
+                    fy2, fye2 = myon.random.int(0, ROWS - 1)
+                    food_x = fx2
+                    food_y = fy2
+                    myon.if tick_ms > 60 then {
+                        tick_ms = tick_ms - 4
+                    }
+
+                    # prev_snapshot is one cell shorter than the new body
+                    # (we just grew); duplicate the old tail so every index
+                    # in the interpolation loop below still lines up.
+                    tail_dup = prev_snapshot[prev_snapshot.length() - 1]
+                    prev_snapshot.push(tail_dup)
+                } myon.else {
+                    body.pop()
+                }
+            }
+
+            prev_body = prev_snapshot
+        }
+
+        # --- render ------------------------------------------------------------
+        now_ms = myon.time.now_ms()
+        raw_ratio1000 = ((now_ms - last_tick_ms) * 1000) / tick_ms
+        myon.if raw_ratio1000 > 1000 then { raw_ratio1000 = 1000 }
+        myon.if raw_ratio1000 < 0 then { raw_ratio1000 = 0 }
+        # ease the motion instead of a flat linear slide, so each hop
+        # decelerates into place rather than moving at constant speed
+        ratio1000 = ease_out_quad(raw_ratio1000)
+
+        myon.if eat_flash_remaining > 0 then {
+            eat_flash_remaining = eat_flash_remaining - FRAME_MS
+            myon.if eat_flash_remaining < 0 then { eat_flash_remaining = 0 }
+        }
+
+        # background: fine vertical gradient (4px bands instead of full grid
+        # cells) so the shade changes in small enough steps to read as a
+        # smooth gradient rather than a staircase of visible stripes.
+        BAND_H = 4
+        band_count = WIN_H / BAND_H
+        band = 0
+        myon.while band < band_count {
+            shade = 14 + (band * 18) / band_count
+            myon.ffi.call_i(handle, str("SDL_SetRenderDrawColor"), str("piiii"),
+                renderer, shade, shade, shade + 10, 255)
+            draw_rect_px(handle, renderer, 0, band * BAND_H, WIN_W, BAND_H)
+            band = band + 1
+        }
+
+        # grid lines
+        myon.ffi.call_i(handle, str("SDL_SetRenderDrawColor"), str("piiii"),
+            renderer, 40, 40, 50, 255)
+        gx = 0
+        myon.while gx <= COLS {
+            draw_rect_px(handle, renderer, gx * CELL, 0, 1, WIN_H)
+            gx = gx + 1
+        }
+
+        # a brief full-screen flash overlay right when food gets eaten, on
+        # top of the gradient/grid but under the snake and food themselves
+        myon.if eat_flash_remaining > 0 then {
+            flash_t1000 = 1000 - (eat_flash_remaining * 1000) / EAT_FLASH_MS
+            flash_alpha = 90 - (ease_out_quad(flash_t1000) * 90) / 1000
+            myon.if flash_alpha < 0 then { flash_alpha = 0 }
+            myon.ffi.call_i(handle, str("SDL_SetRenderDrawColor"), str("piiii"),
+                renderer, 255, 245, 200, flash_alpha)
+            draw_rect_px(handle, renderer, 0, 0, WIN_W, WIN_H)
+        }
+
+        # food: slow, smooth (sine-like) pulse on the inset padding, plus an
+        # extra bright burst for a moment right after it gets eaten.
+        pulse_pad = smooth_pulse(now_ms, 1400, 4)
+        myon.if eat_flash_remaining > 0 then {
+            pulse_pad = 0 - 2
+        }
+        myon.ffi.call_i(handle, str("SDL_SetRenderDrawColor"), str("piiii"),
+            renderer, 235, 90, 90, 120)
+        draw_inset_px(handle, renderer, food_x * CELL, food_y * CELL, 0)
+        myon.ffi.call_i(handle, str("SDL_SetRenderDrawColor"), str("piiii"),
+            renderer, 255, 160, 120, 255)
+        draw_inset_px(handle, renderer, food_x * CELL, food_y * CELL, 5 + pulse_pad)
+
+        # snake body: darker tail fading toward a bright head, each segment
+        # smoothly interpolated from its previous-tick grid cell to its
+        # current-tick grid cell instead of jumping, with a per-segment
+        # slither wobble layered on top so the whole body ripples.
+        bi = 0
+        bn = body.length()
+        pbn = prev_body.length()
+        myon.while bi < bn {
+            cell = body[bi]
+            cy, cye = myon.math.mod(cell, 1000)
+            cx = (cell - cy) / 1000
+
+            # matching previous-tick cell for this index (clamped so a
+            # freshly grown segment just holds its position instead of
+            # interpolating from garbage)
+            pidx = bi
+            myon.if pidx >= pbn then { pidx = pbn - 1 }
+            pcell = prev_body[pidx]
+            pcy, pcye = myon.math.mod(pcell, 1000)
+            pcx = (pcell - pcy) / 1000
+
+            # this segment's own facing direction (from its previous-tick
+            # cell to its current-tick cell), used as the wobble axis so
+            # the ripple pushes sideways relative to actual travel
+            seg_dx = cx - pcx
+            seg_dy = cy - pcy
+
+            # guard against interpolating across a wrap-around edge jump
+            # (e.g. col 31 -> col 0): if the gap is bigger than one cell,
+            # snap instead of sliding all the way across the screen.
+            dxabs = seg_dx
+            myon.if dxabs < 0 then { dxabs = 0 - dxabs }
+            dyabs = seg_dy
+            myon.if dyabs < 0 then { dyabs = 0 - dyabs }
+            myon.if dxabs > 1 myon.or dyabs > 1 then {
+                pcx = cx
+                pcy = cy
+                seg_dx = 0
+                seg_dy = 0
+            }
+
+            draw_x = lerp_i(pcx * CELL, cx * CELL, ratio1000)
+            draw_y = lerp_i(pcy * CELL, cy * CELL, ratio1000)
+
+            # slither wobble: nudge sideways relative to this segment's
+            # travel direction, phase-shifted per segment index so the
+            # ripple visibly travels along the body over time
+            px = perp_x(seg_dx, seg_dy)
+            py = perp_y(seg_dx, seg_dy)
+            wob = segment_wave(bi, now_ms, 900, 2)
+            draw_x = draw_x + px * wob
+            draw_y = draw_y + py * wob
+
+            # corner rounding: compare the direction coming into this
+            # segment (from one segment back) against the direction going
+            # out of it (to one segment forward) — a mismatch means the
+            # body actually bends here, so ease the inset in a bit further
+            # for a rounder, less blocky joint at turns
+            corner_pad = 0
+            myon.if bi > 0 myon.and bi + 1 < bn then {
+                bcell = body[bi - 1]
+                bcy, bcye = myon.math.mod(bcell, 1000)
+                bcx = (bcell - bcy) / 1000
+                ncell = body[bi + 1]
+                ny_, nye = myon.math.mod(ncell, 1000)
+                nx_ = (ncell - ny_) / 1000
+
+                in_dx = cx - bcx
+                in_dy = cy - bcy
+                out_dx = nx_ - cx
+                out_dy = ny_ - cy
+
+                myon.if in_dx != out_dx myon.or in_dy != out_dy then {
+                    corner_pad = 2
+                }
+            }
+
+            myon.if bi == 0 then {
+                myon.ffi.call_i(handle, str("SDL_SetRenderDrawColor"), str("piiii"),
+                    renderer, 140, 245, 170, 255)
+                draw_inset_px(handle, renderer, draw_x, draw_y, 1 + corner_pad)
+
+                # a subtle glossy highlight band across the top of the head
+                myon.ffi.call_i(handle, str("SDL_SetRenderDrawColor"), str("piiii"),
+                    renderer, 210, 255, 225, 140)
+                draw_rect_px(handle, renderer, draw_x + 3, draw_y + 2, CELL - 6, 3)
+
+                # eyes: two small dark dots offset toward the direction of
+                # travel and to each side of the centerline, with a tiny
+                # white glint on each so they don't read as flat holes
+                eye_forward = 4
+                eye_side = 5
+                ex = draw_x + (CELL / 2) + dir_x * eye_forward
+                ey = draw_y + (CELL / 2) + dir_y * eye_forward
+                sxo = py * eye_side
+                syo = px * eye_side
+
+                myon.ffi.call_i(handle, str("SDL_SetRenderDrawColor"), str("piiii"),
+                    renderer, 20, 30, 25, 255)
+                draw_rect_px(handle, renderer, ex + sxo - 1, ey + syo - 1, 3, 3)
+                draw_rect_px(handle, renderer, ex - sxo - 1, ey - syo - 1, 3, 3)
+                myon.ffi.call_i(handle, str("SDL_SetRenderDrawColor"), str("piiii"),
+                    renderer, 255, 255, 255, 220)
+                draw_rect_px(handle, renderer, ex + sxo, ey + syo, 1, 1)
+                draw_rect_px(handle, renderer, ex - sxo, ey - syo, 1, 1)
+
+                # forked tongue: flicks out along the direction of travel
+                # every couple of seconds, with a small Y-split at the tip
+                tlen = tongue_extend(now_ms, 2200, 8)
+                myon.if tlen > 0 then {
+                    base_x = draw_x + (CELL / 2) + dir_x * eye_forward
+                    base_y = draw_y + (CELL / 2) + dir_y * eye_forward
+                    tip_x = base_x + dir_x * tlen
+                    tip_y = base_y + dir_y * tlen
+
+                    # main tongue shaft: a thin bar spanning base->tip,
+                    # oriented along whichever axis the snake is moving on
+                    myon.ffi.call_i(handle, str("SDL_SetRenderDrawColor"), str("piiii"),
+                        renderer, 220, 60, 90, 255)
+                    myon.if dir_x != 0 then {
+                        shaft_x = base_x
+                        shaft_len = tlen
+                        myon.if dir_x < 0 then { shaft_x = tip_x }
+                        draw_rect_px(handle, renderer, shaft_x, base_y, shaft_len, 1)
+                    } myon.else {
+                        shaft_y = base_y
+                        shaft_len = tlen
+                        myon.if dir_y < 0 then { shaft_y = tip_y }
+                        draw_rect_px(handle, renderer, base_x, shaft_y, 1, shaft_len)
+                    }
+                    # small fork prongs at the tip, splayed sideways
+                    draw_rect_px(handle, renderer, tip_x + py - 1, tip_y + px - 1, 2, 2)
+                    draw_rect_px(handle, renderer, tip_x - py - 1, tip_y - px - 1, 2, 2)
+                }
+            } myon.else {
+                # richer gradient toward the tail plus a light glossy strip
+                # down the middle of every segment for a less flat look
+                fade = 90 + (bn - bi) * 5
+                myon.if fade > 210 then { fade = 210 }
+                myon.ffi.call_i(handle, str("SDL_SetRenderDrawColor"), str("piiii"),
+                    renderer, 55, fade, 105, 255)
+                draw_inset_px(handle, renderer, draw_x, draw_y, 2 + corner_pad)
+
+                gloss = 60 + (bn - bi) * 2
+                myon.if gloss > 130 then { gloss = 130 }
+                myon.ffi.call_i(handle, str("SDL_SetRenderDrawColor"), str("piiii"),
+                    renderer, 150, 255, 200, gloss)
+                draw_rect_px(handle, renderer, draw_x + 4, draw_y + 3, CELL - 8, 2)
+
+                # faint scale marking on every other segment for texture
+                is_even, ieerr = myon.math.mod(bi, 2)
+                myon.if is_even == 0 then {
+                    myon.ffi.call_i(handle, str("SDL_SetRenderDrawColor"), str("piiii"),
+                        renderer, 30, 60, 55, 90)
+                    draw_rect_px(handle, renderer, draw_x + (CELL / 2) - 1, draw_y + 5, 2, CELL - 10)
+                }
+            }
+            bi = bi + 1
+        }
+
+        # --- score HUD (drawn inside the game view, not the title bar) -------
+        # backing panel so digits stay readable over the gradient/grid
+        # (sized with headroom for the score "pop" scale-up effect)
+        myon.ffi.call_i(handle, str("SDL_SetRenderDrawColor"), str("piiii"),
+            renderer, 10, 10, 16, 200)
+        draw_rect_px(handle, renderer, 6, 6, 170, 48)
+
+        # score pop: rises past 100% then settles back down with a light
+        # overshoot, instead of a flat linear grow/shrink (still int-only).
+        score_scale = 1000
+        myon.if eat_flash_remaining > 0 then {
+            pop_t1000 = 1000 - (eat_flash_remaining * 1000) / EAT_FLASH_MS
+            score_scale = pop_scale(pop_t1000, 400)
+            myon.ffi.call_i(handle, str("SDL_SetRenderDrawColor"), str("piiii"),
+                renderer, 255, 230, 140, 255)
+        } myon.else {
+            myon.ffi.call_i(handle, str("SDL_SetRenderDrawColor"), str("piiii"),
+                renderer, 120, 240, 160, 255)
+        }
+        draw_number(handle, renderer, 18, 15, score, score_scale)
+
+        myon.ffi.call_v(handle, str("SDL_RenderPresent"), str("p"), renderer)
+
+        frame_elapsed = myon.time.now_ms() - frame_start_ms
+        delay = FRAME_MS - frame_elapsed
+        myon.if delay > 0 then {
+            myon.ffi.call_v(handle, str("SDL_Delay"), str("i"), delay)
+        }
+    }
+
+    myon.print(str("=== Game over ==="))
+    myon.print(str("Reason:"))
+    myon.print(game_over_reason)
+    myon.print(str("Final score:"))
+    myon.print(score)
+
+    myon.ffi.free(evblock)
+    myon.ffi.call_v(handle, str("SDL_DestroyRenderer"), str("p"), renderer)
+    myon.ffi.call_v(handle, str("SDL_DestroyWindow"), str("p"), win)
+    myon.ffi.call_v(handle, str("SDL_Quit"), str(""))
+    myon.ffi.close(handle)
+}
