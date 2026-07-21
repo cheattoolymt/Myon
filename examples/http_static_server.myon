@@ -1,0 +1,27 @@
+# Phase5 HTTP demo: a static-file server, equivalent to `python -m http.server`.
+#
+# This serves the current directory (".") on port 8000. It is a RESIDENT server:
+# calling myon.http.serve_static from the top level runs the event loop until
+# all tasks finish, so control does NOT return here — the process keeps serving
+# until you stop it with Ctrl+C.  Because it never exits on its own, this file
+# lives in examples/ only and is NOT part of the regression tests.
+#
+# Run it, then in ANOTHER terminal try, for example:
+#     curl http://localhost:8000/
+#     curl http://localhost:8000/README.md
+#
+# Content-Type is guessed from the file extension (.html/.css/.js/.png/.json,
+# otherwise application/octet-stream). Paths containing ".." are rejected
+# (directory-traversal protection).
+#
+# Run with:  ./myon examples/http_static_server.myon
+
+module myon.stdio
+module myon.http
+
+myon.print(str("Serving '.' on http://localhost:8000/  (Ctrl+C to stop)"))
+
+ok, err = myon.http.serve_static(8000, str("."))
+myon.if err != myon.nil then {
+    myon.print(str("server error"))
+}

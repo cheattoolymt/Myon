@@ -1,0 +1,28 @@
+# Phase5 Step7: self-contained HTTP static-file serving.
+# The server task starts myon.http.serve_static over the event loop (the accept
+# loop is registered as a daemon task, so the program can still exit once the
+# client work finishes). The client task fetches a fixture file via
+# myon.http.get and verifies the status code and body. Everything runs inside a
+# single Myon process, so the test needs no external curl and stays CI-safe.
+#
+# The served fixture (tests/fixtures/p5_http_root/hello.txt) intentionally has
+# no trailing newline so the printed body is exact.
+module myon.stdio
+module myon.http
+
+myon.async myon.func server() ret int {
+    myon.http.serve_static(19099, "tests/fixtures/p5_http_root")
+    ret 0
+}
+
+myon.async myon.func client() ret int {
+    body, status, err = myon.http.get("http://127.0.0.1:19099/hello.txt")
+    myon.print(status)
+    myon.print(body)
+    ret status
+}
+
+ts = server()
+tc = client()
+myon.await tc
+myon.print(str("done"))

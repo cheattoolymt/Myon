@@ -1,0 +1,37 @@
+# Phase5 Step7: self-contained UDP echo over the event loop.
+# The server task receives a datagram with recv_from (which yields the sender
+# "host:port"), parses that address, and echoes the payload straight back with
+# send_to. The client task then reads the echo. Both run as myon.async
+# coroutines in one process; port 0 + local_port keeps it CI-safe.
+module myon.stdio
+module myon.net
+module myon.string
+
+srv, e1 = myon.net.udp_socket()
+myon.net.bind(srv, "127.0.0.1", 0)
+sport, ep = myon.net.local_port(srv)
+
+myon.async myon.func server() ret int {
+    data, from, e2 = myon.net.recv_from(srv, 1024)
+    parts = myon.string.split(from, ":")
+    fhost = parts[0]
+    fport, fpe = myon.string.to_int(parts[1])
+    myon.net.send_to(srv, data, fhost, fport)
+    ret 0
+}
+
+myon.async myon.func client() ret str {
+    cli, ce = myon.net.udp_socket()
+    myon.net.bind(cli, "127.0.0.1", 0)
+    myon.net.send_to(cli, str("ping-udp"), "127.0.0.1", sport)
+    r, rfrom, re = myon.net.recv_from(cli, 1024)
+    myon.net.close(cli)
+    ret r
+}
+
+ts = server()
+tc = client()
+got = myon.await tc
+myon.await ts
+myon.net.close(srv)
+myon.print(got)

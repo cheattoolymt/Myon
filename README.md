@@ -29,7 +29,7 @@
 | Step 14 | 型推論（単一リテラル代入に限り型注釈省略を許可） | ✅ |
 | Step 15 | ジェネリクス（`myon.struct Box<T>` / `myon.func f<T>`） | ✅ |
 | Step 16 | 標準ライブラリ（`myon.math` / `myon.string`） | ✅ |
-| Step 17 | async/await（実験的・疑似非同期） | ✅ |
+| Step 17 | async/await（実験的・疑似非同期 → Phase5 で協調的イベントループへ本格化） | ✅ |
 | Step 18 | 総合テスト（回帰テストとして `tests/cases/` に集約） | ✅ |
 
 ### Phase 2（追加実装 P1〜P7）
@@ -41,7 +41,7 @@
 | P3 | `myon` 単体起動時の対話式実行（REPL） | ✅ 実装 |
 | P4 | ファイル I/O（`myon.file.read`/`write`/`append`/`exists`） | ✅ 実装 |
 | P5 | エラーメッセージの詳細化（列番号・ソース抜粋・`^` マーカー） | ✅ 実装 |
-| P6 | `myon.async`/`myon.await` の実行モデル → 疑似非同期に確定 | ✅ 設計確定 |
+| P6 | `myon.async`/`myon.await` の実行モデル → 当初は疑似非同期に確定、Phase5 で協調的イベントループへ本格化（OSスレッド化は引き続き不採用） | ✅ 設計確定 |
 | P7 | ジェネリクスの型制約 → 導入しないことに確定 | ✅ 設計確定 |
 
 P1・P3・P4・P5 には対応するテストケース（`tests/cases/p1_multiline_args`,
@@ -188,6 +188,48 @@ SDL/OpenGL のような GUI・ゲームライブラリを実用的に FFI から
 あり、SDL2 が無い環境でも構造体の組み立て・確認部分は独立して動作します。全シグネチャ
 と設計判断は仕様書 [`docs/myon_spec.md`](docs/myon_spec.md) の「10.3.2 GUI/ゲーム制作
 向け FFI 拡張（Phase4.1）」節を参照してください。
+
+### Phase 5（async/await 本格化 — 協調的イベントループ・`myon.net`・`myon.http`）
+
+Step17 の「疑似非同期（呼び出し即同期実行）」を廃止し、シングルスレッドの
+**協調的イベントループ**（`ucontext` ベースのコルーチン、`src/event_loop.{h,c}`）へ
+置き換えました。あわせて低水準ソケット `myon.net`（TCP/UDP）と、その上に構築した
+簡易 HTTP モジュール `myon.http`（静的配信／ルーティングサーバー＋自前 TCP クライアント）
+を追加しています。本物の OS スレッド化は Phase2 P6 の判断どおり採用せず（`refcount` の
+スレッドセーフ化が必要で侵襲が大きすぎるため）、切り替えは `await`／I/O 待ち地点のみで
+起こる協調的マルチタスク（Python asyncio / JS async-await と同じモデル）です。
+
+| ステップ | 内容 | 状態 |
+|---|---|---|
+| Step 1 | イベントループ基盤（`ucontext` コルーチン・`select(2)` 多重化・spawn/await/sleep/IO待ち、`src/event_loop.{h,c}`） | ✅ 実装 |
+| Step 2 | インタプリタ統合（`TYPE_TASK`/`OBJ_TASK`、`is_async` 関数が Task 値を返す、`EXPR_AWAIT` の本実装、トップレベルも1タスク化） | ✅ 実装 |
+| Step 3 | `myon.time.sleep_ms` の非同期対応（コルーチン内は `event_loop_sleep_ms`、同期文脈はブロッキングにフォールバック） | ✅ 実装 |
+| Step 4 | 新規モジュール `myon.net`（`tcp_socket`/`udp_socket`/`bind`/`listen`/`local_port`/`accept`/`connect`/`send`/`recv`/`send_to`/`recv_from`/`close`、ノンブロッキング＋協調待機、`src/net.{h,c}`） | ✅ 実装 |
+| Step 5 | 新規モジュール `myon.http`（`serve_static`/`serve`/`get`/`post`、HTTP/1.0・自前 TCP クライアント、`src/http.{h,c}`） | ✅ 実装 |
+| Step 6 | 仕様書更新（14.9 実行モデル書き換え・10.7 `myon.net`・10.8 `myon.http`・15 Open Questions） | ✅ 実装 |
+| Step 7 | 回帰テスト追加（`p5_async_order`／`p5_net_tcp_echo`／`p5_net_udp_echo`／`p5_http_serve_static`、いずれも自己完結でCI非依存） | ✅ 実装 |
+| Step 8 | README 更新・サンプル追加（`http_static_server`／`http_router_server`／`net_game_echo`） | ✅ 実装 |
+
+各ソケットは常にノンブロッキング（`O_NONBLOCK`）で作られ、`myon.async` 関数の中から
+呼ぶと would-block 時に自動でイベントループへ制御を譲り、他のタスクへ切り替わります。
+`myon.async` を使わないトップレベル（同期文脈）から呼んだ場合は、単一 fd の `select()`
+による同期待機にフォールバックするため、後方互換的な単純スクリプトでもそのまま使えます。
+`myon.http.serve_static`/`serve` の accept ループはデーモンタスクとしてマークされ、
+プログラム終了時のドレイン処理では無視されるため、サーバーを起動しつつ別タスクで
+クライアント処理をして終了する自己完結スクリプトがハングせず終了します。
+
+回帰テストは `tests/cases/p5_async_order`（3タスクが sleep 時間の短い順＝spawn 順とは
+異なる順で完了することを検証）、`p5_net_tcp_echo` / `p5_net_udp_echo`（同一プロセス内で
+サーバー役・クライアント役を両方 `myon.async` タスクとして立て、ポート0＋`local_port`
+で衝突を避けつつ1往復のエコーを検証）、`p5_http_serve_static`（`serve_static` を
+デーモンタスクとして起動しつつ `myon.http.get` で取得、ステータス・本文を検証）で
+カバーします。いずれも外部プロセス（`nc`/`curl`）に依存しない自己完結テストです。
+サンプルは `examples/http_static_server.myon`（`python -m http.server` 相当の静的配信）、
+`examples/http_router_server.myon`（パスに応じて分岐するルーティング＋404）、
+`examples/net_game_echo.myon`（UDP による1対1の座標 echo デモ）に置いてあります
+（常駐サーバー／ネットワークI/Oを伴うため回帰テストには含めません）。全シグネチャと
+実行モデルの詳細は仕様書 [`docs/myon_spec.md`](docs/myon_spec.md) の「14.9 並行処理・
+非同期処理」「10.7 ネットワーク myon.net」「10.8 HTTP myon.http」各節を参照してください。
 
 ## ビルド
 

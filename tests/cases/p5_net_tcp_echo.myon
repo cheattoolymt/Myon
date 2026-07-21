@@ -1,0 +1,36 @@
+# Phase5 Step7: self-contained TCP echo over the event loop.
+# A server task and a client task are both spawned as myon.async coroutines in
+# the same process, so no external command (nc/curl) is needed and CI stays
+# deterministic. The server binds to port 0 (OS picks a free high port), which
+# is read back with myon.net.local_port, avoiding port-collision flakiness.
+module myon.stdio
+module myon.net
+
+srv, e1 = myon.net.tcp_socket()
+myon.net.bind(srv, "127.0.0.1", 0)
+port, ep = myon.net.local_port(srv)
+myon.net.listen(srv, 16)
+
+myon.async myon.func server() ret int {
+    conn, e2 = myon.net.accept(srv)
+    data, e3 = myon.net.recv(conn, 1024)
+    myon.net.send(conn, data)
+    myon.net.close(conn)
+    ret 0
+}
+
+myon.async myon.func client() ret str {
+    cli, ce = myon.net.tcp_socket()
+    myon.net.connect(cli, "127.0.0.1", port)
+    myon.net.send(cli, str("ping-tcp"))
+    r, re = myon.net.recv(cli, 1024)
+    myon.net.close(cli)
+    ret r
+}
+
+ts = server()
+tc = client()
+got = myon.await tc
+myon.await ts
+myon.net.close(srv)
+myon.print(got)
