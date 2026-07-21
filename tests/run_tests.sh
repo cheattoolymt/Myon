@@ -27,6 +27,18 @@ fi
 pass=0
 fail=0
 
+# Phase4.1: build the FFI-callback fixture shared library the callback test
+# depends on.  Best-effort — if the C compiler or dlopen is unavailable the
+# p41_ffi_callback case simply prints "load_fail" and its .out reflects that.
+CB_SRC="tests/fixtures/ffi_callback_test.c"
+CB_SO="tests/fixtures/libffi_callback_test.so"
+if [ -f "$CB_SRC" ]; then
+    CC_BIN="${CC:-cc}"
+    "$CC_BIN" -shared -fPIC -o "$CB_SO" "$CB_SRC" 2>/dev/null \
+        && echo "  (built $CB_SO)" \
+        || echo "  (warning: could not build $CB_SO; callback test may skip)"
+fi
+
 # check_output <name> <myon-file> <expected-file>
 check_output() {
     local name="$1" src="$2" expected="$3"

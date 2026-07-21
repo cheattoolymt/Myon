@@ -1,0 +1,27 @@
+# Phase4.1, Step3: bulk array read/write roundtrips + out-of-range error.
+module myon.ffi
+module myon.stdio
+
+id, e = myon.ffi.alloc(64)
+
+xs = myon.array(int)
+xs.push(1)
+xs.push(2)
+xs.push(3)
+xs.push(4)
+myon.ffi.write_array_i32(id, 0, xs)
+ri, eri = myon.ffi.read_array_i32(id, 0, 4)
+myon.print(ri)             # [1, 2, 3, 4]
+
+fs = myon.array(float)
+fs.push(1.5)
+fs.push(2.5)
+myon.ffi.write_array_f32(id, 16, fs)
+rf, erf = myon.ffi.read_array_f32(id, 16, 2)
+myon.print(rf)             # [1.5, 2.5]
+
+# count past the end of the block must error, not crash
+bad, be = myon.ffi.read_array_i32(id, 0, 1000)
+myon.if be != myon.nil then { myon.print(str("oob_err")) } myon.else { myon.print(str("oob_bad")) }
+
+myon.ffi.free(id)

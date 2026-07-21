@@ -703,6 +703,173 @@ ok, clerr = myon.ffi.close(handle)
 
 ---
 
+#### 10.3.2 GUI/ゲーム制作向け FFI 拡張（Phase4.1）
+
+Phase3.1 までの「`int`/`double`/`ptr`/`string` の単純な値渡し ＋
+バイト列 `write_bytes`/`read_bytes`」だけでは、SDL/OpenGL のような
+GUI・ゲームライブラリを実用的に叩くには不足していた。Phase4.1 では
+次の4系統を追加する。いずれも C 側のヘッダは一切読まず、Myon 側が
+「このレイアウト・この型として扱う」と申告した内容をそのまま信じる
+（Phase3 以来の大方針を踏襲）。
+
+##### (1) 型付きメモリ書き込み（Step1）
+
+`write_bytes` は Myon の `str`（NUL終端）をコピーするため、`int` を
+エンコードした際にNULバイト（`0x00`）が混ざると途中で書き込みが
+切れてしまい、`SDL_Rect` のような「Myon側で値を組み立ててCへ渡す」
+構造体が作れなかった。型付き書き込みは値の生バイト列を
+リトルエンディアンで直接書き込むため、NULバイトを含む値でも欠落なく
+書ける。`read_i64`（Phase3.1）と対になる書き込み側 API である。
+
+| 関数 | シグネチャ | 説明 |
+| ---- | ---------- | ---- |
+| `myon.ffi.write_i64` | `myon.ffi.write_i64(block_id: int, offset: int, v: int) ret bool, error` | `offset` に `v` を8バイト int64（LE）として書き込む |
+| `myon.ffi.write_i32` | `myon.ffi.write_i32(block_id: int, offset: int, v: int) ret bool, error` | `offset` に `v` を4バイト int32（LE、上位32bitは切り捨て）として書き込む |
+| `myon.ffi.write_f64` | `myon.ffi.write_f64(block_id: int, offset: int, v: float) ret bool, error` | `offset` に `v` を8バイト IEEE754 double として書き込む |
+| `myon.ffi.write_f32` | `myon.ffi.write_f32(block_id: int, offset: int, v: float) ret bool, error` | `offset` に `v` を（double→float 変換後の）4バイト IEEE754 float として書き込む |
+
+範囲外オフセットや無効なブロックID、値の型不一致（`i` 系に `float`、
+`f` 系に `int` を渡す等）は `error` を返し、クラッシュしない。
+
+```myon
+module myon.ffi
+module myon.stdio
+
+id, e = myon.ffi.alloc(16)
+myon.ffi.write_i32(id, 0, 100)     # 64 00 00 00
+myon.ffi.write_i32(id, 4, 200)     # C8 00 00 00
+v, ev = myon.ffi.read_i64(id, 0)   # 100 と 200 を結合した LE の値
+myon.print(v)                      # 858993459300
+myon.ffi.free(id)
+```
+
+##### (2) 構造体レイアウト DSL（Step2）
+
+フィールド名（インデックス）と型のリストから、各フィールドの
+オフセットと構造体全体のサイズを自動計算し、オフセットの手計算なしで
+構造体ブロックへ読み書きできる薄い DSL。
+
+- 対応フィールド型は `'i32'` / `'i64'` / `'f32'` / `'f64'` の4種のみ
+  （型付き書き込みでカバーされる型に対応）。
+- **アライメント**は一般的な C 構造体のデフォルト規則に従う。各
+  フィールドはそのサイズの自然境界（4バイト型→4境界、8バイト型→8境界）
+  に配置され、構造体全体のサイズは最大アライメント要求の倍数になるよう
+  末尾がパディングされる。`SDL_Rect`（`int` ×4）ではパディングは
+  発生しないが、`i32`/`i64` が混在する構造体では自動でパディングが入る。
+- 定義は FFI 層内部の「名前→レイアウト」テーブルに保持され、同名の
+  再定義は上書きされる。
+
+| 関数 | シグネチャ | 説明 |
+| ---- | ---------- | ---- |
+| `myon.ffi.struct_def`   | `myon.ffi.struct_def(name: str, field_kinds: array of str) ret int, error` | `field_kinds`（例 `["i32","i32","i32","i32"]`）からレイアウトを定義し、合計サイズ（バイト数）を返す。不正な型文字列は `error` |
+| `myon.ffi.struct_alloc` | `myon.ffi.struct_alloc(name: str) ret int, error` | 定義済み構造体のサイズ分を確保し、ブロックIDを返す糖衣関数。未定義名は `error` |
+| `myon.ffi.struct_write` | `myon.ffi.struct_write(block_id: int, name: str, field_index: int, v: int\|float) ret bool, error` | `field_index` 番目のフィールドへ、その型に応じて書き込む。値の型とフィールド型が矛盾すれば `error` |
+| `myon.ffi.struct_read`  | `myon.ffi.struct_read(block_id: int, name: str, field_index: int) ret int\|float, error` | 同フィールドを読み出す。戻り値のスカラー型（`int`/`float`）はフィールド型から実行時に決まる |
+
+> **`struct_read` の戻り値型についての設計判断**
+> 指示書では「戻り値型を実行時に決める案」と「`struct_read_i` /
+> `struct_read_f` に分ける案」のいずれでもよいとされていた。Myon の
+> タプル返却（`v, e = ...`）は内部的に型なしの配列（`make_result_pair`）
+> にパックして返すため、フィールド型に応じて `int` 値・`float` 値の
+> どちらを詰めても分割代入で自然にアンパックできる。関数を分けるより
+> API が素直になるので、**単一の `struct_read` が実行時にスカラー型を
+> 選ぶ設計**を採用した。
+
+```myon
+module myon.ffi
+module myon.stdio
+
+rf = myon.array(str)
+rf.push(str("i32")); rf.push(str("i32")); rf.push(str("i32")); rf.push(str("i32"))
+sz, e = myon.ffi.struct_def(str("SDL_Rect"), rf)   # 16
+
+r, er = myon.ffi.struct_alloc(str("SDL_Rect"))
+myon.ffi.struct_write(r, str("SDL_Rect"), 0, 50)   # x
+myon.ffi.struct_write(r, str("SDL_Rect"), 1, 60)   # y
+myon.ffi.struct_write(r, str("SDL_Rect"), 2, 200)  # w
+myon.ffi.struct_write(r, str("SDL_Rect"), 3, 100)  # h
+x, ex = myon.ffi.struct_read(r, str("SDL_Rect"), 0)
+myon.print(x)                                      # 50
+myon.ffi.free(r)
+```
+
+`i32`/`i64` 混在の例（`["i32","i64"]`）では、i32 がオフセット0、
+i64 が（8境界へアライメントされて）オフセット8、合計サイズ16 となる。
+
+##### (3) 配列一括読み書き（Step3）
+
+頂点バッファ・色配列のような同型の値の連続を、Myon の `array` から
+1回の呼び出しでブロックへ書き込む／読み出す。内部は単一値版の
+ループなので特別な最適化はしていない（正しさを優先）。
+
+| 関数 | シグネチャ |
+| ---- | ---------- |
+| `myon.ffi.write_array_i32` | `(block_id: int, offset: int, values: array of int) ret bool, error` |
+| `myon.ffi.write_array_i64` | `(block_id: int, offset: int, values: array of int) ret bool, error` |
+| `myon.ffi.write_array_f32` | `(block_id: int, offset: int, values: array of float) ret bool, error` |
+| `myon.ffi.write_array_f64` | `(block_id: int, offset: int, values: array of float) ret bool, error` |
+| `myon.ffi.read_array_i32`  | `(block_id: int, offset: int, count: int) ret array of int, error` |
+| `myon.ffi.read_array_i64`  | `(block_id: int, offset: int, count: int) ret array of int, error` |
+| `myon.ffi.read_array_f32`  | `(block_id: int, offset: int, count: int) ret array of float, error` |
+| `myon.ffi.read_array_f64`  | `(block_id: int, offset: int, count: int) ret array of float, error` |
+
+`i32`/`f32` は要素あたり4バイト、`i64`/`f64` は8バイトを消費する。
+`count`（または書き込む要素数）がブロックの範囲を超える場合は `error`。
+
+```myon
+module myon.ffi
+module myon.stdio
+
+id, e = myon.ffi.alloc(64)
+xs = myon.array(int)
+xs.push(1); xs.push(2); xs.push(3); xs.push(4)
+myon.ffi.write_array_i32(id, 0, xs)
+ri, eri = myon.ffi.read_array_i32(id, 0, 4)
+myon.print(ri)             # [1, 2, 3, 4]
+myon.ffi.free(id)
+```
+
+##### (4) コールバック関数ポインタ（限定版, Step4）
+
+`SDL_SetEventFilter` のように「C ライブラリがコールバック関数ポインタを
+受け取り後で呼び返す」パターンに、**限定的な形**で対応する。
+
+**スコープ（この範囲を超えない）:**
+
+- コールバックの引数は **最大4個**、型は **int64 または ptr（Cポインタ）
+  相当のみ**（Cの `long long (*)(long long, ...)` に類する固定シグネチャ。
+  `double` 引数のコールバックは非対応）。
+- コールバックの戻り値は **int64 のみ**（`void` を返したい場合は戻り値を
+  無視する運用でカバー）。
+- 同時に登録できるコールバックは **固定上限16個**。
+
+**実装方式:** libffi の closure 機構は使わない（依存を増やさないため）。
+C 側にあらかじめ「スロット番号 × 引数個数（0〜4）」ぶんの静的な
+トランポリン関数群を用意し、各トランポリンが自分のスロットに登録された
+Myon 関数値を `call_function()` で呼び返す。シングルスレッド前提のため
+スレッド安全性はスコープ外。コールバック内で `runtime_error` が起きても
+プロセスは落とさず、`stderr` にメッセージを出して戻り値0を返す。
+
+| 関数 | シグネチャ | 説明 |
+| ---- | ---------- | ---- |
+| `myon.ffi.make_callback` | `myon.ffi.make_callback(fn: func, arg_count: int) ret int, error` | Myon の関数値 `fn` をコールバックとして登録し、C から見た生の関数ポインタを `int`（アドレス値）で返す。この値はそのまま `'p'` 引数として `call_i`/`call_v` 等に渡せる。スロット枯渇や `arg_count` 範囲外（0〜4以外）は `error` |
+| `myon.ffi.free_callback` | `myon.ffi.free_callback(ptr: int) ret bool, error` | 登録済みコールバックを解放しスロットを再利用可能にする |
+
+```myon
+module myon.ffi
+module myon.stdio
+
+printer = myon.lambda(x: int) ret int { myon.print(x) ret 0 }
+h, e = myon.ffi.load(str("libfoo.so"))
+cbp, ec = myon.ffi.make_callback(printer, 1)
+# void call_twice(long long (*cb)(long long), long long x) { cb(x); cb(x+1); }
+myon.ffi.call_v(h, str("call_twice"), str("pi"), cbp, 10)   # printer が 10, 11 で2回呼ばれる
+myon.ffi.free_callback(cbp)
+myon.ffi.close(h)
+```
+
+---
+
 ### 10.4 標準ライブラリ myon.math / myon.string（Phase3.5）
 
 Step16で最小実装された `myon.math` / `myon.string` を、Phase3.5で実用的な

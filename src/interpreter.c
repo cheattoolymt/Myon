@@ -30,6 +30,7 @@
 #include "ffi.h"
 #include "ffi_call.h"
 #include "ffi_platform.h"
+#include "ffi_callback.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1016,6 +1017,426 @@ static int call_ffi(Interp *it, Env *env, const char *name, Expr *call, Value *o
         } else {
             *out = make_result_pair(value_int(v), value_nil());
         }
+        return 1;
+    }
+
+    /* -------------------------------------------------------------- */
+    /* Phase4.1, Step1: typed memory writes                           */
+    /* -------------------------------------------------------------- */
+    /* Shared helper macro would obscure the (value, error) style, so each
+     * variant is spelled out.  int variants require an int `v`, float
+     * variants accept float or int (widened to double). */
+    if (strcmp(name, "myon.ffi.write_i64") == 0 ||
+        strcmp(name, "myon.ffi.write_i32") == 0) {
+        int is64 = (strstr(name, "64") != NULL); /* "write_i64" vs "write_i32" */
+        Value bv = eval_arg(it, env, call, 0);
+        Value ov = eval_arg(it, env, call, 1);
+        Value vv = eval_arg(it, env, call, 2);
+        if (bv.type != TYPE_INT || ov.type != TYPE_INT || vv.type != TYPE_INT) {
+            value_free(&bv); value_free(&ov); value_free(&vv);
+            *out = make_result_pair(value_bool(0), value_error(myon_strdup(
+                is64 ? "ffi.write_i64 expects (int block_id, int offset, int v)"
+                     : "ffi.write_i32 expects (int block_id, int offset, int v)")));
+            return 1;
+        }
+        long long b = bv.as.i, o = ov.as.i, v = vv.as.i;
+        value_free(&bv); value_free(&ov); value_free(&vv);
+        int ok = is64 ? ffi_mem_write_i64(ffi_get_state(it), b, o, v)
+                      : ffi_mem_write_i32(ffi_get_state(it), b, o, v);
+        if (!ok)
+            *out = make_result_pair(value_bool(0), value_error(myon_strdup(
+                "ffi.write_i*: invalid block id or out-of-range write")));
+        else
+            *out = make_result_pair(value_bool(1), value_nil());
+        return 1;
+    }
+
+    if (strcmp(name, "myon.ffi.write_f64") == 0 ||
+        strcmp(name, "myon.ffi.write_f32") == 0) {
+        int is64 = (strstr(name, "64") != NULL); /* "write_f64" vs "write_f32" */
+        Value bv = eval_arg(it, env, call, 0);
+        Value ov = eval_arg(it, env, call, 1);
+        Value vv = eval_arg(it, env, call, 2);
+        int nums_ok = (bv.type == TYPE_INT && ov.type == TYPE_INT &&
+                       (vv.type == TYPE_FLOAT || vv.type == TYPE_INT));
+        if (!nums_ok) {
+            value_free(&bv); value_free(&ov); value_free(&vv);
+            *out = make_result_pair(value_bool(0), value_error(myon_strdup(
+                is64 ? "ffi.write_f64 expects (int block_id, int offset, float v)"
+                     : "ffi.write_f32 expects (int block_id, int offset, float v)")));
+            return 1;
+        }
+        long long b = bv.as.i, o = ov.as.i;
+        double v = (vv.type == TYPE_FLOAT) ? vv.as.f : (double)vv.as.i;
+        value_free(&bv); value_free(&ov); value_free(&vv);
+        int ok = is64 ? ffi_mem_write_f64(ffi_get_state(it), b, o, v)
+                      : ffi_mem_write_f32(ffi_get_state(it), b, o, v);
+        if (!ok)
+            *out = make_result_pair(value_bool(0), value_error(myon_strdup(
+                "ffi.write_f*: invalid block id or out-of-range write")));
+        else
+            *out = make_result_pair(value_bool(1), value_nil());
+        return 1;
+    }
+
+    /* -------------------------------------------------------------- */
+    /* Phase4.1, Step2: struct layout DSL                             */
+    /* -------------------------------------------------------------- */
+
+    /* myon.ffi.struct_def(name, field_kinds) ret int, error */
+    if (strcmp(name, "myon.ffi.struct_def") == 0) {
+        Value nv = eval_arg(it, env, call, 0);
+        Value fv = eval_arg(it, env, call, 1);
+        if (nv.type != TYPE_STR || fv.type != TYPE_ARRAY) {
+            value_free(&nv); value_free(&fv);
+            *out = make_result_pair(value_int(-1), value_error(myon_strdup(
+                "ffi.struct_def expects (str name, array of str field_kinds)")));
+            return 1;
+        }
+        ArrayData *a = &fv.as.obj->as.arr;
+        if (a->count <= 0) {
+            value_free(&nv); value_free(&fv);
+            *out = make_result_pair(value_int(-1), value_error(myon_strdup(
+                "ffi.struct_def: field_kinds must be non-empty")));
+            return 1;
+        }
+        FFIFieldKind *kinds =
+            (FFIFieldKind *)myon_xmalloc(sizeof(FFIFieldKind) * (size_t)a->count);
+        int bad = 0;
+        for (int i = 0; i < a->count; i++) {
+            Value *e = &a->items[i];
+            if (e->type != TYPE_STR) { bad = 1; break; }
+            const char *s = e->as.obj->as.str;
+            if      (strcmp(s, "i32") == 0) kinds[i] = FFI_FIELD_I32;
+            else if (strcmp(s, "i64") == 0) kinds[i] = FFI_FIELD_I64;
+            else if (strcmp(s, "f32") == 0) kinds[i] = FFI_FIELD_F32;
+            else if (strcmp(s, "f64") == 0) kinds[i] = FFI_FIELD_F64;
+            else { bad = 1; break; }
+        }
+        if (bad) {
+            free(kinds);
+            value_free(&nv); value_free(&fv);
+            *out = make_result_pair(value_int(-1), value_error(myon_strdup(
+                "ffi.struct_def: field kinds must each be one of "
+                "\"i32\",\"i64\",\"f32\",\"f64\"")));
+            return 1;
+        }
+        long long sz = ffi_struct_define(ffi_get_state(it),
+                                         nv.as.obj->as.str, kinds, a->count);
+        free(kinds);
+        value_free(&nv); value_free(&fv);
+        if (sz < 0)
+            *out = make_result_pair(value_int(-1), value_error(myon_strdup(
+                "ffi.struct_def: invalid struct definition")));
+        else
+            *out = make_result_pair(value_int(sz), value_nil());
+        return 1;
+    }
+
+    /* myon.ffi.struct_alloc(name) ret int, error */
+    if (strcmp(name, "myon.ffi.struct_alloc") == 0) {
+        Value nv = eval_arg(it, env, call, 0);
+        if (nv.type != TYPE_STR) {
+            value_free(&nv);
+            *out = make_result_pair(value_int(-1), value_error(myon_strdup(
+                "ffi.struct_alloc expects (str name)")));
+            return 1;
+        }
+        long long sz = ffi_struct_size(ffi_get_state(it), nv.as.obj->as.str);
+        value_free(&nv);
+        if (sz < 0) {
+            *out = make_result_pair(value_int(-1), value_error(myon_strdup(
+                "ffi.struct_alloc: undefined struct name")));
+            return 1;
+        }
+        long long id = ffi_mem_alloc(ffi_get_state(it), sz);
+        if (id < 0)
+            *out = make_result_pair(value_int(-1), value_error(myon_strdup(
+                "ffi.struct_alloc: out of memory")));
+        else
+            *out = make_result_pair(value_int(id), value_nil());
+        return 1;
+    }
+
+    /* myon.ffi.struct_write(block_id, name, field_index, v) ret bool, error */
+    if (strcmp(name, "myon.ffi.struct_write") == 0) {
+        Value bv = eval_arg(it, env, call, 0);
+        Value nv = eval_arg(it, env, call, 1);
+        Value iv = eval_arg(it, env, call, 2);
+        Value vv = eval_arg(it, env, call, 3);
+        if (bv.type != TYPE_INT || nv.type != TYPE_STR || iv.type != TYPE_INT) {
+            value_free(&bv); value_free(&nv); value_free(&iv); value_free(&vv);
+            *out = make_result_pair(value_bool(0), value_error(myon_strdup(
+                "ffi.struct_write expects (int block_id, str name, int field_index, v)")));
+            return 1;
+        }
+        FFIState *st = ffi_get_state(it);
+        long long b = bv.as.i;
+        int idx = (int)iv.as.i;
+        FFIFieldKind kind;
+        if (!ffi_struct_field_kind(st, nv.as.obj->as.str, idx, &kind)) {
+            value_free(&bv); value_free(&nv); value_free(&iv); value_free(&vv);
+            *out = make_result_pair(value_bool(0), value_error(myon_strdup(
+                "ffi.struct_write: undefined struct name or field index out of range")));
+            return 1;
+        }
+        long long off = ffi_struct_field_offset(st, nv.as.obj->as.str, idx);
+        value_free(&nv); value_free(&iv); value_free(&bv);
+
+        int is_float_field = (kind == FFI_FIELD_F32 || kind == FFI_FIELD_F64);
+        int ok = 0;
+        if (is_float_field) {
+            if (vv.type != TYPE_FLOAT && vv.type != TYPE_INT) {
+                value_free(&vv);
+                *out = make_result_pair(value_bool(0), value_error(myon_strdup(
+                    "ffi.struct_write: float field expects a float value")));
+                return 1;
+            }
+            double v = (vv.type == TYPE_FLOAT) ? vv.as.f : (double)vv.as.i;
+            ok = (kind == FFI_FIELD_F32) ? ffi_mem_write_f32(st, b, off, v)
+                                         : ffi_mem_write_f64(st, b, off, v);
+        } else {
+            if (vv.type != TYPE_INT) {
+                value_free(&vv);
+                *out = make_result_pair(value_bool(0), value_error(myon_strdup(
+                    "ffi.struct_write: int field expects an int value")));
+                return 1;
+            }
+            long long v = vv.as.i;
+            ok = (kind == FFI_FIELD_I32) ? ffi_mem_write_i32(st, b, off, v)
+                                         : ffi_mem_write_i64(st, b, off, v);
+        }
+        value_free(&vv);
+        if (!ok)
+            *out = make_result_pair(value_bool(0), value_error(myon_strdup(
+                "ffi.struct_write: invalid block id or out-of-range write")));
+        else
+            *out = make_result_pair(value_bool(1), value_nil());
+        return 1;
+    }
+
+    /* myon.ffi.struct_read(block_id, name, field_index)
+     *   ret int|float, error
+     * The returned value's type is chosen at run time from the field kind
+     * (int for i32/i64, float for f32/f64).  Myon's tuple return is untyped
+     * (make_result_pair packs a plain array), so a run-time-varying scalar
+     * type unpacks naturally; this is documented in docs/myon_spec.md. */
+    if (strcmp(name, "myon.ffi.struct_read") == 0) {
+        Value bv = eval_arg(it, env, call, 0);
+        Value nv = eval_arg(it, env, call, 1);
+        Value iv = eval_arg(it, env, call, 2);
+        if (bv.type != TYPE_INT || nv.type != TYPE_STR || iv.type != TYPE_INT) {
+            value_free(&bv); value_free(&nv); value_free(&iv);
+            *out = make_result_pair(value_int(0), value_error(myon_strdup(
+                "ffi.struct_read expects (int block_id, str name, int field_index)")));
+            return 1;
+        }
+        FFIState *st = ffi_get_state(it);
+        long long b = bv.as.i;
+        int idx = (int)iv.as.i;
+        FFIFieldKind kind;
+        if (!ffi_struct_field_kind(st, nv.as.obj->as.str, idx, &kind)) {
+            value_free(&bv); value_free(&nv); value_free(&iv);
+            *out = make_result_pair(value_int(0), value_error(myon_strdup(
+                "ffi.struct_read: undefined struct name or field index out of range")));
+            return 1;
+        }
+        long long off = ffi_struct_field_offset(st, nv.as.obj->as.str, idx);
+        value_free(&bv); value_free(&nv); value_free(&iv);
+
+        if (kind == FFI_FIELD_F32 || kind == FFI_FIELD_F64) {
+            double vals[1];
+            int ok = (kind == FFI_FIELD_F32)
+                        ? ffi_mem_read_array_f32(st, b, off, vals, 1)
+                        : ffi_mem_read_array_f64(st, b, off, vals, 1);
+            if (!ok)
+                *out = make_result_pair(value_float(0.0), value_error(myon_strdup(
+                    "ffi.struct_read: invalid block id or out-of-range read")));
+            else
+                *out = make_result_pair(value_float(vals[0]), value_nil());
+        } else {
+            long long vals[1];
+            int ok = (kind == FFI_FIELD_I32)
+                        ? ffi_mem_read_array_i32(st, b, off, vals, 1)
+                        : ffi_mem_read_array_i64(st, b, off, vals, 1);
+            if (!ok)
+                *out = make_result_pair(value_int(0), value_error(myon_strdup(
+                    "ffi.struct_read: invalid block id or out-of-range read")));
+            else
+                *out = make_result_pair(value_int(vals[0]), value_nil());
+        }
+        return 1;
+    }
+
+    /* -------------------------------------------------------------- */
+    /* Phase4.1, Step3: bulk array read/write                         */
+    /* -------------------------------------------------------------- */
+    if (strncmp(name, "myon.ffi.write_array_", 21) == 0) {
+        const char *tag = name + 21; /* "i32"/"i64"/"f32"/"f64" */
+        int is_float = (tag[0] == 'f');
+        int elem_size = (tag[1] == '6') ? 8 : 4;
+        Value bv = eval_arg(it, env, call, 0);
+        Value ov = eval_arg(it, env, call, 1);
+        Value av = eval_arg(it, env, call, 2);
+        if (bv.type != TYPE_INT || ov.type != TYPE_INT || av.type != TYPE_ARRAY) {
+            value_free(&bv); value_free(&ov); value_free(&av);
+            *out = make_result_pair(value_bool(0), value_error(myon_strdup(
+                "ffi.write_array_* expects (int block_id, int offset, array)")));
+            return 1;
+        }
+        long long b = bv.as.i, o = ov.as.i;
+        ArrayData *a = &av.as.obj->as.arr;
+        long long count = a->count;
+        value_free(&bv); value_free(&ov);
+
+        FFIState *st = ffi_get_state(it);
+        int ok = 1;
+        if (is_float) {
+            double *vals = count ? (double *)myon_xmalloc(sizeof(double) * (size_t)count) : NULL;
+            for (long long i = 0; i < count && ok; i++) {
+                Value *e = &a->items[i];
+                if (e->type == TYPE_FLOAT) vals[i] = e->as.f;
+                else if (e->type == TYPE_INT) vals[i] = (double)e->as.i;
+                else ok = 0;
+            }
+            if (ok)
+                ok = (elem_size == 4)
+                        ? ffi_mem_write_array_f32(st, b, o, vals, count)
+                        : ffi_mem_write_array_f64(st, b, o, vals, count);
+            free(vals);
+            if (!ok) {
+                value_free(&av);
+                *out = make_result_pair(value_bool(0), value_error(myon_strdup(
+                    "ffi.write_array_f*: type mismatch, invalid block, or out-of-range")));
+                return 1;
+            }
+        } else {
+            long long *vals = count ? (long long *)myon_xmalloc(sizeof(long long) * (size_t)count) : NULL;
+            for (long long i = 0; i < count && ok; i++) {
+                Value *e = &a->items[i];
+                if (e->type == TYPE_INT) vals[i] = e->as.i;
+                else if (e->type == TYPE_BOOL) vals[i] = e->as.b;
+                else ok = 0;
+            }
+            if (ok)
+                ok = (elem_size == 4)
+                        ? ffi_mem_write_array_i32(st, b, o, vals, count)
+                        : ffi_mem_write_array_i64(st, b, o, vals, count);
+            free(vals);
+            if (!ok) {
+                value_free(&av);
+                *out = make_result_pair(value_bool(0), value_error(myon_strdup(
+                    "ffi.write_array_i*: type mismatch, invalid block, or out-of-range")));
+                return 1;
+            }
+        }
+        value_free(&av);
+        *out = make_result_pair(value_bool(1), value_nil());
+        return 1;
+    }
+
+    if (strncmp(name, "myon.ffi.read_array_", 20) == 0) {
+        const char *tag = name + 20; /* "i32"/"i64"/"f32"/"f64" */
+        int is_float = (tag[0] == 'f');
+        int elem_size = (tag[1] == '6') ? 8 : 4;
+        Value bv = eval_arg(it, env, call, 0);
+        Value ov = eval_arg(it, env, call, 1);
+        Value cv = eval_arg(it, env, call, 2);
+        if (bv.type != TYPE_INT || ov.type != TYPE_INT || cv.type != TYPE_INT) {
+            value_free(&bv); value_free(&ov); value_free(&cv);
+            *out = make_result_pair(value_array(NULL), value_error(myon_strdup(
+                "ffi.read_array_* expects (int block_id, int offset, int count)")));
+            return 1;
+        }
+        long long b = bv.as.i, o = ov.as.i, count = cv.as.i;
+        value_free(&bv); value_free(&ov); value_free(&cv);
+        if (count < 0) {
+            *out = make_result_pair(value_array(NULL), value_error(myon_strdup(
+                "ffi.read_array_*: count must be non-negative")));
+            return 1;
+        }
+        FFIState *st = ffi_get_state(it);
+        if (is_float) {
+            double *vals = count ? (double *)myon_xmalloc(sizeof(double) * (size_t)count) : NULL;
+            int ok = (elem_size == 4)
+                        ? ffi_mem_read_array_f32(st, b, o, vals, count)
+                        : ffi_mem_read_array_f64(st, b, o, vals, count);
+            if (!ok) {
+                free(vals);
+                *out = make_result_pair(value_array(NULL), value_error(myon_strdup(
+                    "ffi.read_array_f*: invalid block id or out-of-range read")));
+                return 1;
+            }
+            Value res = value_array(typespec_prim(TYPE_FLOAT));
+            for (long long i = 0; i < count; i++)
+                array_push(&res, value_float(vals[i]));
+            free(vals);
+            *out = make_result_pair(res, value_nil());
+        } else {
+            long long *vals = count ? (long long *)myon_xmalloc(sizeof(long long) * (size_t)count) : NULL;
+            int ok = (elem_size == 4)
+                        ? ffi_mem_read_array_i32(st, b, o, vals, count)
+                        : ffi_mem_read_array_i64(st, b, o, vals, count);
+            if (!ok) {
+                free(vals);
+                *out = make_result_pair(value_array(NULL), value_error(myon_strdup(
+                    "ffi.read_array_i*: invalid block id or out-of-range read")));
+                return 1;
+            }
+            Value res = value_array(typespec_prim(TYPE_INT));
+            for (long long i = 0; i < count; i++)
+                array_push(&res, value_int(vals[i]));
+            free(vals);
+            *out = make_result_pair(res, value_nil());
+        }
+        return 1;
+    }
+
+    /* -------------------------------------------------------------- */
+    /* Phase4.1, Step4: C-to-Myon callbacks                           */
+    /* -------------------------------------------------------------- */
+
+    /* myon.ffi.make_callback(fn, arg_count) ret int, error */
+    if (strcmp(name, "myon.ffi.make_callback") == 0) {
+        Value fnv = eval_arg(it, env, call, 0);
+        Value acv = eval_arg(it, env, call, 1);
+        if (fnv.type != TYPE_FUNC || acv.type != TYPE_INT) {
+            value_free(&fnv); value_free(&acv);
+            *out = make_result_pair(value_int(0), value_error(myon_strdup(
+                "ffi.make_callback expects (func fn, int arg_count)")));
+            return 1;
+        }
+        int arg_count = (int)acv.as.i;
+        value_free(&acv);
+        if (arg_count < 0 || arg_count > MYON_FFI_CB_MAX_ARGS) {
+            value_free(&fnv);
+            *out = make_result_pair(value_int(0), value_error(myon_strdup(
+                "ffi.make_callback: arg_count must be 0..4")));
+            return 1;
+        }
+        void *ptr = ffi_callback_register(it, fnv, arg_count);
+        value_free(&fnv);
+        if (!ptr)
+            *out = make_result_pair(value_int(0), value_error(myon_strdup(
+                "ffi.make_callback: no free callback slot (max 16)")));
+        else
+            *out = make_result_pair(value_int((long long)(size_t)ptr), value_nil());
+        return 1;
+    }
+
+    /* myon.ffi.free_callback(ptr) ret bool, error */
+    if (strcmp(name, "myon.ffi.free_callback") == 0) {
+        Value pv = eval_arg(it, env, call, 0);
+        if (pv.type != TYPE_INT) {
+            value_free(&pv);
+            *out = make_result_pair(value_bool(0), value_error(myon_strdup(
+                "ffi.free_callback expects (int ptr)")));
+            return 1;
+        }
+        void *ptr = (void *)(size_t)pv.as.i;
+        value_free(&pv);
+        ffi_callback_unregister(ptr);
+        *out = make_result_pair(value_bool(1), value_nil());
         return 1;
     }
 
@@ -2229,6 +2650,84 @@ static Value call_function(Interp *it, int line, Value fn, Value *args, int argc
 }
 
 /* ------------------------------------------------------------------ */
+/* Phase4.1, Step4: C-to-Myon callback slots                           */
+/*                                                                     */
+/* ffi_callback.c hands out static trampoline function pointers keyed  */
+/* by (slot, arg_count); this side owns the Myon function value and    */
+/* interpreter context for each slot and performs the actual call when */
+/* a trampoline fires.  A callback fires from *outside* the normal      */
+/* eval loop (a C library calls back into us), so a runtime_error       */
+/* raised inside the callback body would longjmp past the C frame.  To  */
+/* keep that safe we install a local setjmp barrier around the call:    */
+/* on error we print to stderr and return 0 rather than unwinding into  */
+/* the C library.                                                       */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    int    active;
+    Interp *it;
+    Value   fn;         /* owned copy (TYPE_FUNC) */
+    int    arg_count;
+} MyonCBSlot;
+
+static MyonCBSlot g_myon_cb_slots[MYON_FFI_CB_SLOTS];
+
+void myon_ffi_callback_bind_slot(int slot, Interp *it, Value fn, int arg_count) {
+    if (slot < 0 || slot >= MYON_FFI_CB_SLOTS) return;
+    if (g_myon_cb_slots[slot].active) value_free(&g_myon_cb_slots[slot].fn);
+    g_myon_cb_slots[slot].active = 1;
+    g_myon_cb_slots[slot].it = it;
+    g_myon_cb_slots[slot].fn = value_copy(&fn);
+    g_myon_cb_slots[slot].arg_count = arg_count;
+}
+
+void myon_ffi_callback_clear_slot(int slot) {
+    if (slot < 0 || slot >= MYON_FFI_CB_SLOTS) return;
+    if (g_myon_cb_slots[slot].active) {
+        value_free(&g_myon_cb_slots[slot].fn);
+        g_myon_cb_slots[slot].active = 0;
+        g_myon_cb_slots[slot].it = NULL;
+        g_myon_cb_slots[slot].arg_count = 0;
+    }
+}
+
+long long myon_ffi_callback_dispatch(int slot, int argc, const long long *args) {
+    if (slot < 0 || slot >= MYON_FFI_CB_SLOTS) return 0;
+    MyonCBSlot *cb = &g_myon_cb_slots[slot];
+    if (!cb->active || !cb->it) return 0;
+
+    Interp *it = cb->it;
+
+    /* Marshal int64 arguments into Myon int values. */
+    Value argv[MYON_FFI_CB_MAX_ARGS];
+    for (int i = 0; i < argc; i++) argv[i] = value_int(args[i]);
+
+    /* Install a temporary error barrier so a runtime_error in the callback
+     * body does not longjmp across the foreign C frame. */
+    jmp_buf saved;
+    memcpy(&saved, &it->on_error, sizeof(jmp_buf));
+
+    long long ret = 0;
+    if (setjmp(it->on_error) == 0) {
+        Value r = call_function(it, 0, cb->fn, argv, argc, NULL);
+        if (r.type == TYPE_INT)       ret = r.as.i;
+        else if (r.type == TYPE_BOOL) ret = r.as.b;
+        else                          ret = 0; /* non-int return -> 0 */
+        value_free(&r);
+    } else {
+        fprintf(stderr,
+                "myon: runtime error inside FFI callback (slot %d); "
+                "returning 0\n", slot);
+        ret = 0;
+    }
+
+    /* restore the outer barrier */
+    memcpy(&it->on_error, &saved, sizeof(jmp_buf));
+
+    for (int i = 0; i < argc; i++) value_free(&argv[i]);
+    return ret;
+}
+
+/* ------------------------------------------------------------------ */
 /* Expression evaluation                                               */
 /* ------------------------------------------------------------------ */
 
@@ -2936,6 +3435,7 @@ Interp *interp_create(void) {
 
 void interp_free(Interp *it) {
     if (!it) return;
+    ffi_callback_reset_all(); /* drop any live FFI callback slots (Phase4.1) */
     env_free(it->global);
     free(it->structs.items);
     if (it->ffi) ffi_state_free(it->ffi);
@@ -3006,6 +3506,7 @@ int interpret(Program *program) {
         rc = run_toplevel(&it, program);
     }
 
+    ffi_callback_reset_all(); /* drop any live FFI callback slots (Phase4.1) */
     env_free(it.global);
     free(it.structs.items);
     if (it.ffi) ffi_state_free(it.ffi);

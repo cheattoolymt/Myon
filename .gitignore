@@ -2,3 +2,4 @@
 /build/
 /myon
 *.o
+tests/fixtures/libffi_callback_test.so

@@ -151,6 +151,44 @@ myon.string（Phase3.5）」節にまとめてあります。
 仕様書 [`docs/myon_spec.md`](docs/myon_spec.md) の「7.1 配列メソッド」「14.2 辞書/マップ型」
 「10.4 myon.math」「10.5 myon.time」「10.6 myon.random」各節を参照してください。
 
+### Phase 4.1（GUI/ゲーム制作向け FFI 拡張 — 型付き書き込み・構造体レイアウト DSL・配列一括読み書き・コールバック）
+
+SDL/OpenGL のような GUI・ゲームライブラリを実用的に FFI から叩けるよう、Phase3.1
+までの「単純な値渡し＋バイト列」を4系統で拡張しました。いずれも C 側のヘッダは
+一切読まず、Myon 側が申告したレイアウト・型をそのまま信じる方針（Phase3 以来）です。
+
+| ステップ | 内容 | 状態 |
+|---|---|---|
+| Step 1 | 型付きメモリ書き込み `myon.ffi.write_i64`/`write_i32`/`write_f64`/`write_f32`（NULバイトを含む値も欠落なく書ける、`ffi_mem_write_*`） | ✅ 実装 |
+| Step 2 | 構造体レイアウト DSL `myon.ffi.struct_def`/`struct_alloc`/`struct_write`/`struct_read`（自然アライメント・末尾パディング自動計算、`ffi_struct_define`ほか） | ✅ 実装 |
+| Step 3 | 配列一括読み書き `myon.ffi.write_array_*`/`read_array_*`（i32/i64/f32/f64、`ffi_mem_write_array_*`/`ffi_mem_read_array_*`） | ✅ 実装 |
+| Step 4 | コールバック関数ポインタ（限定版）`myon.ffi.make_callback`/`free_callback`（libffi 不使用、静的トランポリン、`src/ffi_callback.{h,c}`） | ✅ 実装 |
+| Step 5 | 仕様書 10.3.2 節を追加 | ✅ 実装 |
+| Step 6 | 回帰テスト追加（`p41_*`、コールバックは fixture の `.so` を事前ビルド） | ✅ 実装 |
+| Step 7 | README 更新・`SDL_Rect` サンプル追加 | ✅ 実装 |
+
+型付き書き込みは値の生バイト列をリトルエンディアンで直接書き込むため、`int` の
+エンコードに NUL バイトが混ざっても途切れません（`write_bytes` の制約を解消）。
+構造体レイアウト DSL は `["i32","i32","i32","i32"]` のような型リストから各フィールドの
+オフセットと合計サイズを自動計算し、C のデフォルト構造体パディング（自然アライメント＋
+末尾パディング）に従います（`SDL_Rect` はパディングなしで16バイト、`i32`/`i64` 混在は
+自動でパディング）。`struct_read` の戻り値スカラー型はフィールド型から実行時に決まります
+（Myon のタプル返却が型なし配列パックのため単一関数で自然に扱える、という設計判断）。
+配列一括読み書きは頂点/色配列のような同型データを1回の呼び出しでやり取りします。
+コールバックは **引数最大4個・int64/ptr のみ・戻り値 int64 のみ・同時16スロット** の
+限定スコープで、libffi の closure を使わず静的トランポリン関数群を介して Myon 関数を
+呼び返します（シングルスレッド前提）。
+
+回帰テストは `tests/cases/p41_ffi_write_typed`（型付き書き込みの roundtrip、NUL バイトを
+含む値を明示）、`p41_ffi_struct_dsl`（i32 のみ／i32・i64 混在パディング）、
+`p41_ffi_array_bulk`（配列 roundtrip＋範囲外エラー）、`p41_ffi_callback`（C→Myon コール
+バック、スロット再利用）でカバーします。コールバックテストは CI 再現性のため
+`tests/fixtures/ffi_callback_test.c` を `tests/run_tests.sh` が実行前に `.so` へビルド
+します。構造体 DSL を使った `SDL_Rect` の組み立て例は `examples/ffi_sdl_rect.myon` に
+あり、SDL2 が無い環境でも構造体の組み立て・確認部分は独立して動作します。全シグネチャ
+と設計判断は仕様書 [`docs/myon_spec.md`](docs/myon_spec.md) の「10.3.2 GUI/ゲーム制作
+向け FFI 拡張（Phase4.1）」節を参照してください。
+
 ## ビルド
 
 ```sh

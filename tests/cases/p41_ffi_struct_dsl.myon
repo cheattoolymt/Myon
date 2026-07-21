@@ -1,0 +1,40 @@
+# Phase4.1, Step2: struct layout DSL.
+# i32-only struct (SDL_Rect, no padding) + i32/i64 mixed struct (padding).
+module myon.ffi
+module myon.stdio
+
+rf = myon.array(str)
+rf.push(str("i32"))
+rf.push(str("i32"))
+rf.push(str("i32"))
+rf.push(str("i32"))
+sz, e = myon.ffi.struct_def(str("SDL_Rect"), rf)
+myon.print(sz)             # 16
+
+r, er = myon.ffi.struct_alloc(str("SDL_Rect"))
+myon.ffi.struct_write(r, str("SDL_Rect"), 0, 50)
+myon.ffi.struct_write(r, str("SDL_Rect"), 1, 60)
+myon.ffi.struct_write(r, str("SDL_Rect"), 2, 200)
+myon.ffi.struct_write(r, str("SDL_Rect"), 3, 100)
+x, ex = myon.ffi.struct_read(r, str("SDL_Rect"), 0)
+w, ew = myon.ffi.struct_read(r, str("SDL_Rect"), 2)
+myon.print(x)              # 50
+myon.print(w)              # 200
+
+# mixed i32/i64: offset 0 (i32), offset 8 (i64, aligned), total size 16
+mf = myon.array(str)
+mf.push(str("i32"))
+mf.push(str("i64"))
+sz2, e2 = myon.ffi.struct_def(str("Mix"), mf)
+myon.print(sz2)            # 16
+
+m, em = myon.ffi.struct_alloc(str("Mix"))
+myon.ffi.struct_write(m, str("Mix"), 0, 7)
+myon.ffi.struct_write(m, str("Mix"), 1, 123456789012)
+a, ea = myon.ffi.struct_read(m, str("Mix"), 0)
+b, eb = myon.ffi.struct_read(m, str("Mix"), 1)
+myon.print(a)              # 7
+myon.print(b)              # 123456789012
+
+myon.ffi.free(r)
+myon.ffi.free(m)
