@@ -40,7 +40,8 @@ typedef enum {
     TYPE_MAP,         /* myon.map(K, V)    (section 14.2) */
     TYPE_STRUCT,      /* user struct instance (section 8) */
     TYPE_FUNC,        /* function / lambda value (section 6) */
-    TYPE_TYPEPARAM    /* an unresolved generic type parameter T (14.8) */
+    TYPE_TYPEPARAM,   /* an unresolved generic type parameter T (14.8) */
+    TYPE_TASK         /* Phase5: async task/future handle (internal only) */
 } Type;
 
 const char *type_name(Type t);

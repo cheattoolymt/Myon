@@ -36,6 +36,7 @@ const char *type_name(Type t) {
         case TYPE_STRUCT:    return "struct";
         case TYPE_FUNC:      return "func";
         case TYPE_TYPEPARAM: return "typeparam";
+        case TYPE_TASK:      return "task";
     }
     return "?";
 }

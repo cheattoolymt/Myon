@@ -1044,6 +1044,121 @@ bad, berr = myon.random.int(5, 1)    // berr != myon.nil（lo > hi）
 
 ---
 
+### 10.7 ネットワーク myon.net（Phase5）
+
+IPv4 の TCP / UDP ソケットを直接扱うための低水準モジュール。POSIX
+ソケットAPI（`socket`/`bind`/`listen`/`accept`/`connect`/`send`/`recv`/
+`sendto`/`recvfrom`）の薄いラッパである。**現状の対応プラットフォームは
+Linux のみ**で、それ以外では全関数が即座に `error` を返す（後述）。
+
+ソケットは整数の**ソケットID**で識別する。IDは内部テーブル（最大256個）の
+インデックスであり、生のfdではない。全関数は非ブロッキングfdで動作し、
+イベントループ上のコルーチン内から呼ばれた場合は自動的に協調的な待機
+（イベントループへの譲渡）に切り替わる。トップレベル（コルーチン外）から
+呼ばれた場合は単一fdの `select()` による同期待機にフォールバックする。
+
+| 関数 | シグネチャ | 説明 |
+|------|-----------|------|
+| `tcp_socket` | `() ret int, error` | TCPソケットを生成しIDを返す。失敗時 `-1` + error |
+| `udp_socket` | `() ret int, error` | UDPソケットを生成しIDを返す。失敗時 `-1` + error |
+| `bind` | `(id: int, host: str, port: int) ret bool, error` | 指定アドレス/ポートにバインド。`host=""` は `INADDR_ANY` |
+| `listen` | `(id: int, backlog: int) ret bool, error` | 接続待ち受けを開始する |
+| `local_port` | `(id: int) ret int, error` | `bind(port=0)` 後などの実際のローカルポート番号を返す |
+| `accept` | `(id: int) ret int, error` | 接続を受理し、新しい接続ソケットのIDを返す（協調的に待機） |
+| `connect` | `(id: int, host: str, port: int) ret bool, error` | 相手へ接続する（非ブロッキング接続を協調的に待機） |
+| `send` | `(id: int, data: str) ret int, error` | 送信したバイト数を返す |
+| `recv` | `(id: int, maxlen: int) ret str, error` | 最大 `maxlen` バイト受信した文字列を返す（`maxlen<=0` は4096） |
+| `send_to` | `(id: int, data: str, host: str, port: int) ret int, error` | UDP宛先指定送信 |
+| `recv_from` | `(id: int, maxlen: int) ret str, str, error` | UDP受信。**3値タプル** `(data, "host:port", error)` |
+| `close` | `(id: int) ret bool, error` | ソケットを閉じる（常に成功扱い） |
+
+**エラー方針**：整数を返す関数（`tcp_socket`/`local_port`/`send` など）は
+失敗時に `-1` と `error` を、`bool` を返す関数（`bind`/`listen`/`connect`）は
+`false` と `error` を返す。`recv_from` のみ受信データ・送信元・エラーの
+3値を返し、失敗時は空文字列2つと `error` を返す。
+
+**非ブロッキング挙動**：内部的に would-block（`EAGAIN`/`EWOULDBLOCK`）は
+`-2` として扱い、`recv`/`accept` は読み取り可能まで、`send`/`connect` は
+書き込み可能まで、それぞれイベントループに譲渡して待機する。この待機は
+`myon.async`/`myon.await` と組み合わせて複数接続を並行処理するための土台と
+なる（→ 14.9）。
+
+**未サポート**：Linux以外のプラットフォーム、IPv6、TLS（後述の Open Questions
+を参照）。非対応プラットフォームでは全関数が `myon.net unsupported on this
+platform` の error を返す。
+
+```myon
+module myon.net
+
+// TCPエコーサーバー（1接続だけ受けて返す簡単な例）
+srv, e1 = myon.net.tcp_socket()
+myon.net.bind(srv, "", 0)              // ポート0で任意ポートにバインド
+port, ep = myon.net.local_port(srv)    // 実際のポート番号を取得
+myon.net.listen(srv, 16)
+
+conn, e2 = myon.net.accept(srv)        // 接続を協調的に待機
+data, e3 = myon.net.recv(conn, 1024)
+myon.net.send(conn, data)              // エコー
+myon.net.close(conn)
+myon.net.close(srv)
+```
+
+---
+
+### 10.8 HTTP myon.http（Phase5）
+
+`myon.net` の上に構築された最小限の HTTP モジュール。サーバー2種と
+クライアント2種を提供する。**HTTP/1.0・1コネクション1リクエスト固定**であり、
+Keep-Alive は行わない（レスポンスに `Connection: close` を付与する）。
+
+| 関数 | シグネチャ | 説明 |
+|------|-----------|------|
+| `serve_static` | `(port: int, root: str) ret bool, error` | `root` 以下の静的ファイルを配信するサーバーを起動 |
+| `serve` | `(port: int, handler: func) ret bool, error` | リクエストごとに `handler` を呼ぶ動的サーバーを起動 |
+| `get` | `(url: str) ret str, int, error` | GETリクエスト。**3値** `(body, status, error)` |
+| `post` | `(url: str, body: str, content_type: str) ret str, int, error` | POSTリクエスト。**3値** `(body, status, error)` |
+
+**サーバーの実行モデル**：`serve_static`/`serve` は受理ループ（accept loop）を
+イベントループ上のコルーチンとして起動し、接続ごとにさらに別のコルーチンを
+spawnして並行処理する。受理ループとそのラッパーは**デーモンタスク**として
+マークされるため、プログラム終了時のドレイン処理では無視される。これにより
+自己完結スクリプト（サーバーを起動し、別タスクでクライアント処理をして終了）
+がハングせずに終了できる。トップレベルからサーバー関数を直接呼んだ場合は、
+そのまま全タスク完了までブロックし続ける（常駐サーバー用途）。
+
+**静的配信のパス解決**：`http_resolve_static_path` が `..` を含むパスや制御
+バイトを含むパスを拒否し（ディレクトリトラバーサル防止）、`/` および末尾
+スラッシュは `index.html` にマップする。
+
+**ハンドラ規約**（`serve`）：`handler(method: str, path: str, body: str)` の形で
+呼ばれ、返した文字列がレスポンスボディになる。現状のレスポンスは常に
+`200 OK` / `Content-Type: text/plain` 固定である（ステータス・ヘッダの
+カスタマイズは未対応、→ Open Questions）。
+
+**クライアント**：`get`/`post` はlibcurl等に依存せず、生のTCP（`myon.net`）で
+HTTP/1.0リクエストを自力で組み立てる自己完結実装である。`https://` は
+未対応（TLS未実装）。戻り値はボディ・ステータスコード・エラーの3値で、
+URLパースや接続に失敗した場合は空ボディ・ステータス `0`・`error` を返す。
+
+```myon
+module myon.http
+
+// 静的ファイルサーバー（常駐）
+myon.http.serve_static(8080, "./public")
+
+// 動的ハンドラ
+fn handler(method: str, path: str, body: str) ret str {
+    ret "hello from " + path
+}
+myon.http.serve(8080, handler)
+
+// クライアント
+body, status, err = myon.http.get("http://127.0.0.1:8080/")
+myon.print(status)                      // 200
+```
+
+---
+
 ## 11. モジュールシステム
 
 ```myon
@@ -1326,28 +1441,63 @@ myon.func first<T>(xs: myon.array(T)) ret T {
 モデルであることを踏まえ、言語の複雑度を抑える実用性重視の判断としてこの方針を
 確定する。将来、型制約がないと困る具体的な利用シーンが現れた段階で改めて検討する。
 
-### 14.9 並行処理・非同期処理
+### 14.9 並行処理・非同期処理（Phase5 で本格化）
 
 `myon.async` / `myon.await` を導入する。
 
 ```myon
 myon.async myon.func fetchData() ret str {
+    myon.await myon.time.sleep_ms(50)
     ret str("結果")
 }
 
 result = myon.await fetchData()
 ```
 
-**実行モデルは疑似非同期（シングルスレッド）に確定する。**
-`myon.async` / `myon.await` はシングルスレッド上での糖衣構文であり、
-`myon.async` 関数は呼び出された時点で即座に同期実行される。複数の
-`myon.async` 関数が物理的に並行して進行することはない。
+**実行モデル：シングルスレッド・協調的イベントループ（Phase5 で確定）。**
 
-この判断は実用性重視の方針による。本格的な並行実行（スレッド／イベントループ）
-を導入すると、値の参照カウント（`refcount`）をスレッドセーフにする必要があり、
-処理系本体アーキテクチャの大規模な見直しが必要になる。まずは軽量な疑似非同期を
-正式仕様として確定し、本格的な並行実行が必要になった場合は別途大規模な設計
-フェーズとして切り出す。
+Phase5 以前の「疑似非同期（呼び出し即同期実行）」は廃止され、次の本格的だが
+軽量な非同期モデルに置き換えられた。
+
+- 処理系はプロセス内にただ 1 つの **協調的イベントループ**（`src/event_loop.c`）
+  を持つ。
+- `myon.async myon.func` を呼び出しても本体はその場では実行されず、
+  **タスク（コルーチン）** として生成され、その関数呼び出し式は
+  **Task 値**（内部型 `TYPE_TASK`。ユーザーが型注釈に書くことは想定しない）を
+  即座に返す。挙動は Python の `asyncio.create_task` に近い。
+- `myon.await <Task>` は、対象タスクが完了するまで **現在のコルーチンを協調的に
+  一時停止**し、その間イベントループは他の準備完了タスクを実行する。対象が完了
+  したら再開し、その戻り値を返す（対象タスク内で実行時エラーが発生していた場合は
+  `myon.await` 地点で同じ実行時エラーとして再送出される）。
+- I/O 待ち（ソケットの read/write/accept/connect、`myon.time.sleep_ms` 等）は
+  OS スレッドをブロックせず、イベントループの `select(2)` 待ちに登録され、
+  他のタスクへ制御が回る。
+- タスクの切り替わりは **`await` 地点・I/O 待ち地点でのみ** 起こる（協調的
+  マルチタスク）。タイムスライスによる強制中断（プリエンプション）は行わない。
+  これは Python asyncio / JavaScript async-await と同じモデルである。
+- `myon.async` を使わない同期的なコード（トップレベルスクリプトなど）から
+  `myon.time.sleep_ms` や `myon.net.*` を呼んだ場合は、従来どおりの
+  **ブロッキング動作にフォールバック**する（後方互換）。
+
+**後方互換性**：オペランドが Task 値でない（= `myon.async` でない普通の式に
+`myon.await` を書いた）場合、`myon.await` はその値をそのまま返す。これにより
+Phase5 以前の擬似非同期を前提としたコード（`result = myon.await fetchData()` の
+ような単一値返却）はそのまま動作する。
+
+**コルーチンの実装方式**：POSIX `ucontext.h` の `makecontext`/`swapcontext` を用い、
+各タスクに専用の C スタック（256KB）を割り当てる方式（方式A）を採用した。これに
+より既存のツリーウォークインタプリタ（`eval_expr`/`exec_stmt` の再帰呼び出し）を
+一切変更せずに済む。各タスクは自分専用の C スタック上で通常どおり再帰し、`await`／
+I/O 待ち地点で `swapcontext` によりループ本体へ制御を返す。
+
+**採用しなかった選択肢**：本物の OS スレッド化（マルチコア並列実行）は採用しない。
+値の参照カウント（`refcount`）をスレッドセーフにする大改修が必要で、処理系全体への
+侵襲が大きすぎるため（Phase2 P6 の判断を継続）。プリエンプティブなタスク切り替えも
+行わない。
+
+**対応プラットフォーム**：`ucontext` ベースのイベントループは Linux（glibc）を
+本命とする。`ucontext` を欠くプラットフォームでは未対応スタブとしてコンパイルされる
+（FFI サブシステムと同じポリシー）。
 
 ---
 
@@ -1356,8 +1506,23 @@ result = myon.await fetchData()
 - `myon.map` のキー型に許される範囲（str/int以外の任意型を許すか）
 - 型推論をリテラル以外の式（関数呼び出し結果等）にも広げるか
 
-> 以下は Phase 2 で確定済みのため本リストから除外した。
-> - `myon.async`/`myon.await` の実行モデル → 疑似非同期に確定（14.9節）
+Phase5（`myon.net`/`myon.http`）で今回スコープ外とし、今後の検討課題として
+残した事項：
+
+- **IPv6対応**：現状の `myon.net` はIPv4のみ。`AF_INET6` の追加をどう表現するか
+- **TLS/HTTPS対応**：`myon.http.get`/`post` の `https://`、およびTLSサーバー。
+  自前実装は非現実的なため外部ライブラリ（OpenSSL等）への依存をどう扱うか
+- **HTTPサーバーのKeep-Alive対応**：現状はHTTP/1.0・1コネクション1リクエスト
+  固定。`Connection: keep-alive` / HTTP/1.1 chunked をサポートするか
+- **レスポンスヘッダ・ステータスコードのカスタマイズ**：`serve` のハンドラは
+  現状ボディ文字列のみを返し、常に `200 OK` / `text/plain` 固定。任意の
+  ステータス・ヘッダを返せるAPI形状（構造体を返す等）をどうするか
+- **本物のマルチスレッド化**：現状の並行処理は単一スレッドの協調的コルーチン
+  （14.9節）。OSスレッド/マルチコア並列をどう表現するか（当面は導入しない）
+
+> 以下は Phase 5 で確定済みのため本リストから除外した。
+> - `myon.async`/`myon.await` の実行モデル → 単一スレッドの協調的イベント
+>   ループ（ucontextベースのコルーチン）に確定（14.9節）
 > - ジェネリクスの型制約 → 導入しないことに確定（14.8節）
 >
 > 以下は Phase 3.5 で確定済みのため本リストから除外した。
