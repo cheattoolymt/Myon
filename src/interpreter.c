@@ -67,6 +67,26 @@
 /* Interpreter state and control-flow signalling                       */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Phase5.2: maximum interpreter-level function-call nesting depth.
+ *
+ * The tree-walker evaluates a Myon function call by recursing on the native
+ * C stack (call_function -> exec_block -> eval_expr -> call_function -> ...).
+ * A deeply recursive Myon program therefore consumes the C stack directly and,
+ * without a guard, overflows it and is killed by the OS with SIGSEGV before any
+ * diagnostic can be printed.  We cap the nesting and raise a normal Myon
+ * runtime error instead (same graceful path as the Step12 integer-overflow
+ * checks).
+ *
+ * Sizing: the default thread/main C stack is 8 MiB on Linux and macOS.  Each
+ * Myon frame chains several C frames (call_function + exec_block + a few
+ * eval_expr levels) which empirically measured well under ~2 KiB per Myon
+ * frame in an -O2 build, but debug/ASan builds and heavier expressions use
+ * considerably more.  A cap of 4000 keeps us comfortably inside 8 MiB with a
+ * wide safety margin while still allowing genuinely deep (non-pathological)
+ * recursion.  Tail-call optimisation is intentionally out of scope. */
+#define MYON_MAX_CALL_DEPTH 4000
+
 typedef enum { FLOW_NORMAL, FLOW_BREAK, FLOW_CONTINUE, FLOW_RETURN } Flow;
 
 /* registry of declared structs (for constructor / method lookup) */
@@ -109,6 +129,13 @@ struct Interp {
     Task        *current_task;
     /* Phase5 myon.net: socket table (lazily created on first myon.net use). */
     NetState    *net;
+    /* Phase5.2: current interpreter-level call-nesting depth, used to guard
+     * against C-stack overflow from unbounded Myon recursion.  Incremented on
+     * entry to call_function and decremented on every (normal or error) exit.
+     * Because a runtime_error longjmps straight back to the top-level barrier,
+     * the deep frames never run their decrement, so interp_run/interpret reset
+     * this to 0 after catching an error (see those functions). */
+    int          call_depth;
 };
 typedef struct Interp Interp;
 
@@ -2910,6 +2937,20 @@ static Value call_function(Interp *it, int line, Value fn, Value *args, int argc
         runtime_error(it, line, "function '%s' expects %d argument(s), got %d",
                       fd->name ? fd->name : "<lambda>", fd->param_count, argc);
 
+    /* Phase5.2: guard the native C stack against unbounded Myon recursion.
+     * We check *before* entering another frame so the limit reflects the depth
+     * we are about to reach.  On overflow we raise a normal runtime error
+     * (which longjmps to the top-level barrier where call_depth is reset) rather
+     * than letting the OS kill us with SIGSEGV.  Note: it->call_depth has not
+     * yet been incremented for this frame, so comparing >= against the cap makes
+     * the (depth+1)-th nested call the one that fails. */
+    if (it->call_depth >= MYON_MAX_CALL_DEPTH)
+        runtime_error(it, line,
+            "call stack too deep: recursion exceeded %d nested calls "
+            "(possible infinite recursion in '%s')",
+            MYON_MAX_CALL_DEPTH, fd->name ? fd->name : "<lambda>");
+    it->call_depth++;
+
     Env *call_env = env_new(fn.as.obj->as.fn.closure);
 
     /* bind self for methods */
@@ -2962,6 +3003,10 @@ static Value call_function(Interp *it, int line, Value fn, Value *args, int argc
     it->ret_count = saved_cnt;
 
     env_free(call_env);
+    /* Phase5.2: pop this frame's depth on the normal (return/void) exit path.
+     * The runtime_error paths above intentionally skip this because they
+     * longjmp past here to the top-level barrier, which resets call_depth. */
+    it->call_depth--;
     return result;
 }
 
@@ -3002,6 +3047,13 @@ static void async_task_entry(void *ud) {
     Value *res = (Value *)myon_xmalloc(sizeof(Value));
     int has_error = 0;
 
+    /* Phase5.2: the coroutine runs on its own fresh C stack, so its recursion
+     * budget is independent of the caller's.  Save the caller's depth, start
+     * the body at 0, and restore afterwards (the error path longjmps to the
+     * barrier below without unwinding the coroutine's frames). */
+    int saved_depth = it->call_depth;
+    it->call_depth = 0;
+
     if (setjmp(it->on_error) == 0) {
         *res = call_function(it, 0, ctx->fn, ctx->args, ctx->argc, NULL);
     } else {
@@ -3010,6 +3062,7 @@ static void async_task_entry(void *ud) {
         has_error = 1;
     }
 
+    it->call_depth = saved_depth;
     memcpy(&it->on_error, &saved, sizeof(jmp_buf));
     it->current_task = prev_task;
 
@@ -3129,6 +3182,12 @@ static int http_read_request(Interp *it, NetState *st, int sock_id,
         return -1;
     }
     long want = tmp.content_length;
+    /* Phase5.2 audit fix: Content-Length is attacker-controlled, so cap the
+     * body we are willing to buffer.  Without this a request advertising e.g.
+     * "Content-Length: 999999999999" would drive an unbounded myon_xrealloc and
+     * exhaust memory (DoS).  16 MiB mirrors the spirit of the 1 MiB header cap
+     * above while comfortably covering realistic form/JSON payloads. */
+    if (want > (16L << 20)) { http_request_free(&tmp); free(buf); return -1; }
     if (want > 0 && (size_t)want > have_body) {
         size_t need = (size_t)want - have_body;
         size_t need_cap = len + need;
@@ -3248,6 +3307,10 @@ static void http_conn_task_entry(void *ud) {
     HttpRequest req;
     if (http_read_request(it, c->st, c->conn_id, &req) == 0) {
         char *body_out = NULL;
+        /* Phase5.2: this handler runs on the connection coroutine's own C
+         * stack; give it an independent recursion budget (see async_task_entry). */
+        int saved_depth = it->call_depth;
+        it->call_depth = 0;
         if (setjmp(it->on_error) == 0) {
             Value args[3];
             args[0] = value_str(myon_strdup(req.method));
@@ -3263,6 +3326,7 @@ static void http_conn_task_entry(void *ud) {
         } else {
             body_out = myon_strdup("500 Internal Server Error");
         }
+        it->call_depth = saved_depth;
         size_t rlen = 0;
         char *resp = http_build_response(200, "OK", "text/plain",
                                          body_out, strlen(body_out), &rlen);
@@ -3644,6 +3708,13 @@ long long myon_ffi_callback_dispatch(int slot, int argc, const long long *args) 
     jmp_buf saved;
     memcpy(&saved, &it->on_error, sizeof(jmp_buf));
 
+    /* Phase5.2: the callback fires synchronously from within a foreign C frame
+     * that is itself nested under our own call stack, so depth keeps
+     * accumulating here (no reset).  But if the body raises, the longjmp to the
+     * barrier below skips the per-frame decrements, so snapshot the depth and
+     * restore it on the way out to keep the counter balanced. */
+    int saved_depth = it->call_depth;
+
     long long ret = 0;
     if (setjmp(it->on_error) == 0) {
         Value r = call_function(it, 0, cb->fn, argv, argc, NULL);
@@ -3658,6 +3729,7 @@ long long myon_ffi_callback_dispatch(int slot, int argc, const long long *args) 
         ret = 0;
     }
 
+    it->call_depth = saved_depth;
     /* restore the outer barrier */
     memcpy(&it->on_error, &saved, sizeof(jmp_buf));
 
@@ -4487,7 +4559,11 @@ int interp_run(Interp *it, Program *program) {
     it->programs[it->program_count++] = program;
 
     if (setjmp(it->on_error)) {
-        /* a runtime error aborted this program; interpreter stays alive */
+        /* a runtime error aborted this program; interpreter stays alive.
+         * Phase5.2: the erroring frame longjmped straight here without running
+         * the per-frame call_depth decrements, so reset the counter for the
+         * next program the (REPL) interpreter runs. */
+        it->call_depth = 0;
         return 1;
     }
     return run_toplevel(it, program);
@@ -4501,6 +4577,7 @@ int interpret(Program *program) {
     int rc = 0;
     if (setjmp(it.on_error)) {
         rc = 1;
+        it.call_depth = 0; /* Phase5.2: see interp_run() */
     } else {
         rc = run_toplevel(&it, program);
     }

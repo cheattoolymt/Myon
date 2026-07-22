@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <sys/select.h>   /* fd_set, FD_ZERO, FD_SET, select() (Phase5.2) */
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>

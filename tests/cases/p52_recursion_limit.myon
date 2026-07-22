@@ -1,0 +1,18 @@
+/*
+ * Phase5.2 regression: unbounded (effectively-infinite for our purposes)
+ * recursion must be caught by the interpreter's call-depth guard and reported
+ * as a normal Myon runtime error, NOT crash the process with SIGSEGV.
+ *
+ * Before Phase5.2 this program exited with signal 11 (exit code 139) because
+ * each Myon call recursed directly on the native C stack until the OS killed
+ * it.  Now MYON_MAX_CALL_DEPTH bounds the nesting and we exit(1) with a
+ * formatted "call stack too deep" diagnostic.  The test harness only pins the
+ * non-zero exit (see the accompanying .err fixture).
+ */
+myon.func f(n: int) ret int {
+    myon.if n <= 0 then {
+        ret 0
+    }
+    ret f(n - 1) + 1
+}
+myon.print(str(f(50000)))
