@@ -1,0 +1,99 @@
+# Phase5.1, Step12 — SDL_mixer audio playback demo (via FFI).
+#
+# Sound effects and background music matter a lot for game feel, but Myon has
+# no dedicated audio subsystem.  This sample shows how to drive SDL_mixer
+# (libSDL2_mixer) entirely through the existing FFI layer: initialise SDL's
+# audio subsystem, open a mixer device, (optionally) load a WAV chunk, play it,
+# and tear everything down again.
+#
+# This is a NON-INTERACTIVE demo.  On a headless / no-audio-device environment
+# (this container included) Mix_OpenAudio typically fails because there is no
+# usable audio backend.  The script detects that, prints the SDL error, and
+# exits cleanly instead of crashing — so it is safe to run anywhere.  It is
+# intentionally NOT part of the regression tests (tests/cases/) because CI has
+# no audio device.
+#
+# Run with:  ./myon examples/ffi_sdl_audio.myon
+#
+# NOTE: requires both libSDL2-2.0.so.0 and libSDL2_mixer-2.0.so.0 to be
+# installed.  On Debian/Ubuntu:  apt-get install libsdl2-mixer-2.0-0
+
+module myon.ffi
+module myon.stdio
+
+# SDL / SDL_mixer constants (fixed values from the SDL2 headers).
+SDL_INIT_AUDIO     = 16       # 0x00000010
+MIX_DEFAULT_FORMAT = 32784    # 0x8010  (AUDIO_S16SYS on little-endian)
+MIX_FREQUENCY      = 44100
+MIX_CHANNELS       = 2
+MIX_CHUNKSIZE      = 2048
+
+handle, err = myon.ffi.load(str("libSDL2-2.0.so.0"))
+myon.if err != myon.nil then {
+    myon.print(str("SDL2 not available; skipping audio demo"))
+} myon.else {
+    mixhandle, merr = myon.ffi.load(str("libSDL2_mixer-2.0.so.0"))
+    myon.if merr != myon.nil then {
+        myon.print(str("SDL2_mixer not available; skipping audio demo"))
+        myon.ffi.close(handle)
+    } myon.else {
+        # SDL_Init(SDL_INIT_AUDIO) -> int  (0 on success, negative on failure)
+        rc, e1 = myon.ffi.call_i(handle, str("SDL_Init"), str("i"), SDL_INIT_AUDIO)
+        myon.print(str("SDL_Init(AUDIO) returned:"))
+        myon.print(rc)
+
+        myon.if rc != 0 then {
+            myon.print(str("SDL audio subsystem unavailable; skipping playback"))
+            myon.ffi.call_v(handle, str("SDL_Quit"), str(""))
+            myon.ffi.close(mixhandle)
+            myon.ffi.close(handle)
+            myon.print(str("done (skipped)"))
+        } myon.else {
+            # int Mix_OpenAudio(int frequency, Uint16 format,
+            #                   int channels, int chunksize) -> 0 on success
+            openrc, oerr = myon.ffi.call_i(mixhandle, str("Mix_OpenAudio"),
+                                           str("iiii"),
+                                           MIX_FREQUENCY, MIX_DEFAULT_FORMAT,
+                                           MIX_CHANNELS, MIX_CHUNKSIZE)
+            myon.print(str("Mix_OpenAudio rc (0 == success):"))
+            myon.print(openrc)
+
+            myon.if openrc != 0 then {
+                # Most likely there is no audio device (headless container).
+                myon.print(str("Mix_OpenAudio failed (no audio device?); skipping playback"))
+            } myon.else {
+                # Mix_Chunk *Mix_LoadWAV(const char *file)
+                # examples/beep.wav is a tiny 16-bit PCM WAV bundled alongside
+                # this script.  Mix_LoadWAV returns a Mix_Chunk* (carried as an
+                # int pointer handle via call_p); NULL (0) means load failure.
+                chunk, cerr = myon.ffi.call_p(mixhandle, str("Mix_LoadWAV"),
+                                              str("s"), str("examples/beep.wav"))
+                myon.if chunk == 0 then {
+                    myon.print(str("Mix_LoadWAV failed (file missing?); skipping play"))
+                } myon.else {
+                    # int Mix_PlayChannel(int channel, Mix_Chunk *chunk, int loops)
+                    # channel = -1  -> first free channel;  loops = 0 -> play once.
+                    ch, perr = myon.ffi.call_i(mixhandle, str("Mix_PlayChannel"),
+                                               str("ipi"), -1, chunk, 0)
+                    myon.print(str("Mix_PlayChannel channel:"))
+                    myon.print(ch)
+
+                    # Give the sound ~500ms to play before tearing down.
+                    myon.ffi.call_v(handle, str("SDL_Delay"), str("i"), 500)
+
+                    # void Mix_FreeChunk(Mix_Chunk *chunk)
+                    myon.ffi.call_v(mixhandle, str("Mix_FreeChunk"), str("p"), chunk)
+                }
+
+                # void Mix_CloseAudio(void)
+                myon.ffi.call_v(mixhandle, str("Mix_CloseAudio"), str(""))
+            }
+
+            # void SDL_Quit(void)
+            myon.ffi.call_v(handle, str("SDL_Quit"), str(""))
+            myon.ffi.close(mixhandle)
+            myon.ffi.close(handle)
+            myon.print(str("done"))
+        }
+    }
+}

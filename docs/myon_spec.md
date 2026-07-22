@@ -994,6 +994,39 @@ myon.ffi.free(event_block)
 （動作するサンプルは `examples/ffi_sdl_event_loop.myon`。実際の入力操作が
 ある `examples/snake5.myon` も同じパターンでイベントを読んでいる。）
 
+##### (6) SDL_mixer によるオーディオ再生（Phase5.1）
+
+効果音・BGM 再生は、専用のオーディオ・モジュールを新設せず、FFI 経由で
+SDL_mixer（`libSDL2_mixer`）を叩くことで実現する。`libSDL2-2.0.so.0` と
+`libSDL2_mixer-2.0.so.0` の 2 つを `myon.ffi.load` で読み込み、以下の流れで
+再生する:
+
+1. `SDL_Init(SDL_INIT_AUDIO)` でオーディオサブシステムを初期化する
+   （`SDL_INIT_AUDIO = 0x10 = 16`）。
+2. `int Mix_OpenAudio(int frequency, Uint16 format, int channels,
+   int chunksize)` でミキサーを開く。一般的な設定値は
+   `frequency=44100`、`format=MIX_DEFAULT_FORMAT`（`0x8010 = 32784`、
+   リトルエンディアンでは `AUDIO_S16SYS` に相当）、`channels=2`、
+   `chunksize=2048`。成功時 `0` を返す。sig は `"iiii"`。
+3. `Mix_Chunk *Mix_LoadWAV(const char *file)` で WAV を読み込む（sig `"s"`、
+   戻り値はポインタ handle なので `call_p`。失敗時は `0`/NULL）。
+4. `int Mix_PlayChannel(int channel, Mix_Chunk *chunk, int loops)` で再生する
+   （`channel=-1` は空きチャンネル、`loops=0` は 1 回再生。sig `"ipi"`）。
+5. 後片付け: `Mix_FreeChunk(chunk)` → `Mix_CloseAudio()` → `SDL_Quit()` →
+   `myon.ffi.close`。
+
+**既知の制約:**
+
+- `Mix_OpenAudio` は**利用可能なオーディオデバイスが無い環境（CI コンテナ、
+  ヘッドレスサーバ等）では失敗する**（負値/非0を返す）。サンプルはこの失敗を
+  検知して、クラッシュせずにエラーメッセージを表示して終了する作りにすること。
+- `MIX_DEFAULT_FORMAT` の値は SDL_mixer のビルド（エンディアン）に依存する。
+  上記 `0x8010` は一般的なリトルエンディアン x86-64 ビルドの値。
+
+（動作するサンプルは `examples/ffi_sdl_audio.myon`。テスト用の小さな WAV
+`examples/beep.wav` を同梱している。オーディオデバイスの無い環境では
+`Mix_OpenAudio` の失敗を確認するに留まる。）
+
 ---
 
 ### 10.4 標準ライブラリ myon.math / myon.string（Phase3.5）
