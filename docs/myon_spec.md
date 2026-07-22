@@ -561,6 +561,11 @@ myon.print(myon.file.exists("/tmp/does_not_exist.txt"))  // false
   そのため本フェーズのFFIだけでは、ウィンドウを出して一定時間後に閉じる
   程度のデモは組めるが、`SDL_PollEvent` を使う一般的なイベントループ形式の
   GUIアプリは組めない。
+  （この制約は Phase3 時点のもの。Phase3.1 のメモリ確保／型付き読み出しと
+  Phase4.1 の型付き書き込み・構造体DSL、および Phase5.1 で追加した
+  `myon.ffi.read_i32` によって、確保済みブロックを `'b'` で渡し `SDL_Event`
+  のフィールドを読み戻す形で out 方向の構造体読み取りが可能になった。
+  詳細は後述の「(5) SDL_Event の読み取り（Phase5.1）」を参照。）
 - 引数の並びは「整数系（`i`/`p`/`s`）の引数がすべて先、`double`（`d`）の
   引数がすべて後」の順序のみサポートする（x86-64 System V ABI の
   レジスタ割り当てに対応。SDL2 の主要関数はこの並びに収まる）。
@@ -613,6 +618,7 @@ Phase3のFFIだけでは、(1) 文字列を返すC関数の中身を読めない
 | `myon.ffi.write_bytes` | `myon.ffi.write_bytes(block_id: int, offset: int, data: str) ret bool, error` | ブロック内の `offset` から `data` のバイト列を書き込む（成功時 `true`）。範囲外は `error` |
 | `myon.ffi.read_bytes`  | `myon.ffi.read_bytes(block_id: int, offset: int, len: int) ret str, error`    | ブロックの `[offset, offset+len)` を `str` として読み出す。範囲外は `error` |
 | `myon.ffi.read_i64`    | `myon.ffi.read_i64(block_id: int, offset: int) ret int, error`                | ブロックの `offset` から8バイトをリトルエンディアンの `int` として読み出す。範囲外は `error` |
+| `myon.ffi.read_i32`    | `myon.ffi.read_i32(block_id: int, offset: int) ret int, error`                | ブロックの `offset` から4バイトをリトルエンディアンの int32 として読み出し、符号拡張して `int` を返す（`read_i64` の4バイト版。Phase5.1で追加）。範囲外は `error` |
 
 **ブロックIDと生アドレスは別の名前空間**
 
@@ -895,6 +901,98 @@ myon.ffi.call_v(h, str("call_twice"), str("pi"), cbp, 10)   # printer が 10, 11
 myon.ffi.free_callback(cbp)
 myon.ffi.close(h)
 ```
+
+##### (5) SDL_Event の読み取り（out 方向構造体読み取り, Phase5.1）
+
+ゲーム制作に必須の入力取得（キーボード・マウス・ウィンドウクローズ）は、
+`int SDL_PollEvent(SDL_Event *event)` のように「C 関数が構造体メモリへ
+書き込んで返す（out 引数）」パターンに依存する。Phase5.1 で追加した
+`myon.ffi.read_i32`（+ Phase3.1 の `alloc` / `'b'` 引数）を組み合わせることで、
+確保済みブロックを `SDL_Event*` として渡し、書き戻されたフィールドを
+Myon 側で読み取れるようになった。
+
+**基本的な流れ:**
+
+1. `SDL_Event` ぶんのブロックを `myon.ffi.alloc` で確保する。`SDL_Event` は
+   C の共用体（union）で、そのサイズは含まれる最大メンバのサイズになる。
+   SDL2 では伝統的に 56 バイト前後だが、**バージョンやビルドオプションで
+   変わりうる**ため、Myon 側は C ヘッダを読まない前提で「安全に大きめ」
+   （例: 128 バイト）を確保しておくのが実践的な妥協策。
+2. ブロックを `'b'` 引数として `SDL_PollEvent` に渡す（`call_i`, sig `"b"`）。
+   戻り値は「イベントがあったか」を表す 0/1 の `int`。
+3. 書き戻された `SDL_Event` の先頭 4 バイト（`Uint32 type`）を
+   `myon.ffi.read_i32(block, 0)` で読み、イベント種別を判定する。
+
+**主要なイベント種別の定数**（SDL2 `SDL_events.h`。値は固定）:
+
+| 定数 | 値 | 意味 |
+| ---- | -- | ---- |
+| `SDL_QUIT` | `256` (`0x100`) | ウィンドウを閉じる操作等 |
+| `SDL_KEYDOWN` | `768` (`0x300`) | キー押下 |
+| `SDL_KEYUP` | `769` (`0x301`) | キー解放 |
+| `SDL_MOUSEMOTION` | `1024` (`0x400`) | マウス移動 |
+| `SDL_MOUSEBUTTONDOWN` | `1025` (`0x401`) | マウスボタン押下 |
+| `SDL_MOUSEBUTTONUP` | `1026` (`0x402`) | マウスボタン解放 |
+
+**`SDL_KeyboardEvent` の主なオフセット**（SDL2, x86-64 の一般的なレイアウト。
+すべて `read_i32` で 4 バイト読み出す）:
+
+| offset | フィールド | 説明 |
+| ------ | ---------- | ---- |
+| 0  | `Uint32 type` | イベント種別（上表の定数） |
+| 4  | `Uint32 timestamp` | タイムスタンプ |
+| 8  | `Uint32 windowID` | ウィンドウ ID |
+| 12 | `Uint8 state` / `Uint8 repeat` | 押下(1)/解放(0)・リピート（KEYDOWN/KEYUP の type でも判別可能） |
+| 16 | `SDL_Scancode scancode` | 物理キー位置を表すスキャンコード |
+| 20 | `SDL_Keycode sym` | 論理キーコード（多くのキーで ASCII 近似。例: `SDLK_a` = 97） |
+
+```myon
+module myon.ffi
+module myon.stdio
+
+SDL_QUIT    = 256
+SDL_KEYDOWN = 768
+
+handle, err = myon.ffi.load(str("libSDL2-2.0.so.0"))
+# SDL_Init(SDL_INIT_VIDEO) など（省略。examples/ffi_sdl_event_loop.myon 参照）
+
+# SDL_Event ぶんのバッファ（安全のため 128 バイト確保）
+event_block, aerr = myon.ffi.alloc(128)
+
+running = true
+myon.while running {
+    # int SDL_PollEvent(SDL_Event *event) — sig "b" で確保済みブロックを渡す
+    has_event, perr = myon.ffi.call_i(handle, str("SDL_PollEvent"),
+                                      str("b"), event_block)
+    myon.if has_event != 0 then {
+        ev_type, terr = myon.ffi.read_i32(event_block, 0)   # 先頭4バイト = type
+        myon.if ev_type == SDL_QUIT then {
+            running = false
+        } myon.elif ev_type == SDL_KEYDOWN then {
+            sym, serr = myon.ffi.read_i32(event_block, 20)  # 論理キーコード
+            myon.print(sym)
+        }
+    }
+    myon.ffi.call_v(handle, str("SDL_Delay"), str("i"), 16)
+}
+
+myon.ffi.free(event_block)
+```
+
+**既知の制約:**
+
+- `SDL_Event` の正確なレイアウト・サイズは **SDL2 のバージョンやビルド
+  オプションによって変わりうる**。ここに示すオフセットは一般的な x86-64
+  ビルドに基づく目安であり、環境によってはずれる可能性がある。ブロックを
+  大きめに確保し、まず `type`（offset 0）が期待値になることを確認してから
+  他フィールドを解釈すること。
+- 全イベント種別（ゲームパッド、タッチ、テキスト入力等）のレイアウトを
+  網羅しているわけではない。実用上必要となる `SDL_QUIT` /
+  `SDL_KeyboardEvent`（およびマウス系）の読み取りを主眼とする。
+- リトルエンディアン（x86-64 ネイティブ）を前提とする。
+
+（動作するサンプルは `examples/ffi_sdl_event_loop.myon`。実際の入力操作が
+ある `examples/snake5.myon` も同じパターンでイベントを読んでいる。）
 
 ---
 

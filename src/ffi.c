@@ -189,6 +189,23 @@ int ffi_mem_read_i64(FFIState *st, long long block_id, long long offset,
     return 1;
 }
 
+int ffi_mem_read_i32(FFIState *st, long long block_id, long long offset,
+                     long long *out) {
+    if (offset < 0) return 0;
+    long long size = ffi_mem_size(st, block_id);
+    if (size < 0) return 0;                 /* invalid / freed */
+    if (offset > size || (long long)sizeof(int32_t) > size - offset) return 0;
+    const unsigned char *base = (const unsigned char *)ffi_mem_ptr(st, block_id);
+    if (!base) return 0;
+    /* assemble little-endian (x86-64 native), then sign-extend to int64 */
+    uint32_t v = 0;
+    for (int i = 0; i < 4; i++) {
+        v |= (uint32_t)base[offset + i] << (8 * i);
+    }
+    *out = (long long)(int32_t)v;
+    return 1;
+}
+
 /* ---- Phase4.1, Step1: typed memory writes ---- */
 
 /*

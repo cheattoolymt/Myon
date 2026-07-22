@@ -126,6 +126,18 @@ int ffi_mem_read_i64(FFIState *st, long long block_id, long long offset,
                      long long *out);
 
 /*
+ * Phase5.1, Step7 — read 4 bytes of block `block_id` at `offset` as a
+ * little-endian int32 (x86-64 native order), sign-extended into the returned
+ * int64.  This is the read-side counterpart of ffi_mem_write_i32 and the
+ * primitive used to pull 4-byte fields (e.g. the `Uint32 type` at offset 0 of
+ * an SDL_Event, or the `sym` keycode at offset 20) out of an out-parameter
+ * struct.  Returns 1 on success and stores the value in *out; returns 0 for an
+ * invalid ID or an out-of-range span.
+ */
+int ffi_mem_read_i32(FFIState *st, long long block_id, long long offset,
+                     long long *out);
+
+/*
  * Phase4.1, Step1 — typed memory writes.
  *
  * These are the write-side counterparts of ffi_mem_read_i64.  Unlike

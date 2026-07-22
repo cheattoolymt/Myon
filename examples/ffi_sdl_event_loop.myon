@@ -1,0 +1,108 @@
+# Phase5.1, Step8 — SDL_Event read-back demo (out-parameter struct reading).
+#
+# Phase3 could not handle functions that write a struct through an out pointer
+# (such as int SDL_PollEvent(SDL_Event *event)).  Phase3.1 (typed reads) and
+# Phase4.1 (typed writes / struct DSL) made this possible in principle, and
+# Phase5.1 Step7 added myon.ffi.read_i32 to pull the individual 4-byte fields
+# of the event back out.  This sample is the end-to-end proof: it opens a
+# window, polls events, and reads the leading `Uint32 type` field (offset 0) of
+# each SDL_Event to distinguish SDL_QUIT / SDL_KEYDOWN / SDL_KEYUP.
+#
+# SDL_Event is a C union; its total size varies by SDL2 build (commonly 56
+# bytes), so we allocate a generously oversized 128-byte block for safety.
+#
+# Relevant SDL_Event / SDL_KeyboardEvent layout (SDL2, x86-64):
+#   offset 0  : Uint32 type       (SDL_QUIT=256, SDL_KEYDOWN=768, SDL_KEYUP=769)
+#   offset 8  : Uint32 windowID   (keyboard/window events)
+#   offset 16 : SDL_Scancode scancode  (keyboard events)
+#   offset 20 : SDL_Keycode  sym        (keyboard events; near-ASCII, SDLK_a=97)
+#
+# This is a NON-INTERACTIVE demo intended to run headless without crashing.
+# It is intentionally NOT part of the regression tests (tests/cases/) because
+# CI has no display.
+#
+# Run with:  ./myon examples/ffi_sdl_event_loop.myon
+#            SDL_VIDEODRIVER=dummy ./myon examples/ffi_sdl_event_loop.myon  (headless)
+
+module myon.ffi
+module myon.stdio
+
+# SDL constants
+SDL_INIT_VIDEO          = 32          # 0x00000020
+SDL_WINDOWPOS_UNDEFINED = 536805376   # 0x1FFF0000
+SDL_WINDOW_SHOWN        = 4           # 0x00000004
+
+# SDL_Event type constants (fixed values from SDL_events.h).
+SDL_QUIT      = 256   # 0x100
+SDL_KEYDOWN   = 768   # 0x300
+SDL_KEYUP     = 769   # 0x301
+
+handle, err = myon.ffi.load(str("libSDL2-2.0.so.0"))
+myon.if err != myon.nil then {
+    myon.print(str("SDL2 not available; skipping event-loop demo"))
+} myon.else {
+    # SDL_Init(SDL_INIT_VIDEO) -> int   (0 on success, negative on failure)
+    rc, e1 = myon.ffi.call_i(handle, str("SDL_Init"), str("i"), SDL_INIT_VIDEO)
+    myon.print(str("SDL_Init returned:"))
+    myon.print(rc)
+
+    myon.if rc != 0 then {
+        # Headless / no-video environment: initialisation failed.  Still
+        # exercise the memory + read_i32 path so the demo proves those work
+        # even when SDL itself is unusable, then exit cleanly.
+        myon.print(str("SDL_Init failed; verifying alloc + read_i32 only"))
+        event_block, aerr = myon.ffi.alloc(128)
+        myon.ffi.write_i32(event_block, 0, SDL_KEYDOWN)
+        probe, perr = myon.ffi.read_i32(event_block, 0)
+        myon.print(str("read_i32 probe (expect 768):"))
+        myon.print(probe)
+        myon.ffi.free(event_block)
+        myon.ffi.close(handle)
+        myon.print(str("done (skipped windowed loop)"))
+    } myon.else {
+        # SDL_CreateWindow(title, x, y, w, h, flags) -> SDL_Window*
+        win, e2 = myon.ffi.call_p(handle, str("SDL_CreateWindow"),
+                                  str("siiiii"),
+                                  str("Myon Event Loop"),
+                                  SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+                                  640, 480, SDL_WINDOW_SHOWN)
+
+        # SDL_Event buffer (safely oversized; SDL_Event is ~56 bytes).
+        event_block, aerr = myon.ffi.alloc(128)
+
+        # Poll for up to 300 frames (~5s at 16ms/frame) or until SDL_QUIT.
+        running = true
+        frame = 0
+        myon.while running myon.and frame < 300 {
+            # int SDL_PollEvent(SDL_Event *event); "b" -> call_i returns the
+            # "was there an event" flag as an int (1/0).
+            has_event, perr = myon.ffi.call_i(handle, str("SDL_PollEvent"),
+                                              str("b"), event_block)
+            myon.if has_event != 0 then {
+                # Leading 4-byte field of every SDL_Event is Uint32 type.
+                ev_type, terr = myon.ffi.read_i32(event_block, 0)
+
+                myon.if ev_type == SDL_QUIT then {
+                    myon.print(str("quit event"))
+                    running = false
+                } myon.elif ev_type == SDL_KEYDOWN then {
+                    # `sym` keycode lives at offset 20 (near-ASCII; SDLK_a=97).
+                    sym, serr = myon.ffi.read_i32(event_block, 20)
+                    myon.print(str("keydown event, sym:"))
+                    myon.print(sym)
+                } myon.elif ev_type == SDL_KEYUP then {
+                    myon.print(str("keyup event"))
+                }
+            }
+            frame = frame + 1
+            # SDL_Delay(Uint32 ms) -> void
+            myon.ffi.call_v(handle, str("SDL_Delay"), str("i"), 16)
+        }
+
+        myon.ffi.free(event_block)
+        myon.ffi.call_v(handle, str("SDL_DestroyWindow"), str("p"), win)
+        myon.ffi.call_v(handle, str("SDL_Quit"), str(""))
+        myon.ffi.close(handle)
+        myon.print(str("done"))
+    }
+}

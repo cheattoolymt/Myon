@@ -1020,25 +1020,36 @@ static int call_ffi(Interp *it, Env *env, const char *name, Expr *call, Value *o
      * Reads 8 bytes as a little-endian int64.  Convenience for pulling an
      * out-parameter pointer (e.g. sqlite3* from sqlite3_open) out of a block
      * as a plain address value. */
-    if (strcmp(name, "myon.ffi.read_i64") == 0) {
+    /* myon.ffi.read_i32(block_id, offset) ret int, error  (Phase5.1, Step7)
+     *
+     * Reads 4 bytes as a little-endian int32, sign-extended to int.  The
+     * read-side counterpart of ffi.write_i32; used to pull 4-byte out-parameter
+     * fields (e.g. the `Uint32 type` at offset 0, or the `sym` keycode at
+     * offset 20, of an SDL_Event) back out of a block. */
+    if (strcmp(name, "myon.ffi.read_i64") == 0 ||
+        strcmp(name, "myon.ffi.read_i32") == 0) {
+        int is64 = (strstr(name, "64") != NULL); /* "read_i64" vs "read_i32" */
         Value bv = eval_arg(it, env, call, 0);
         Value ov = eval_arg(it, env, call, 1);
         if (bv.type != TYPE_INT || ov.type != TYPE_INT) {
             value_free(&bv); value_free(&ov);
             *out = make_result_pair(value_int(0),
                 value_error(myon_strdup(
-                    "ffi.read_i64 expects (int block_id, int offset)")));
+                    is64 ? "ffi.read_i64 expects (int block_id, int offset)"
+                         : "ffi.read_i32 expects (int block_id, int offset)")));
             return 1;
         }
         long long block_id = bv.as.i;
         long long offset   = ov.as.i;
         value_free(&bv); value_free(&ov);
         long long v = 0;
-        int ok = ffi_mem_read_i64(ffi_get_state(it), block_id, offset, &v);
+        int ok = is64 ? ffi_mem_read_i64(ffi_get_state(it), block_id, offset, &v)
+                      : ffi_mem_read_i32(ffi_get_state(it), block_id, offset, &v);
         if (!ok) {
             *out = make_result_pair(value_int(0),
                 value_error(myon_strdup(
-                    "ffi.read_i64: invalid block id or out-of-range read")));
+                    is64 ? "ffi.read_i64: invalid block id or out-of-range read"
+                         : "ffi.read_i32: invalid block id or out-of-range read")));
         } else {
             *out = make_result_pair(value_int(v), value_nil());
         }
