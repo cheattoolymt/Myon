@@ -38,6 +38,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -97,8 +98,15 @@ static char *addr_to_str(const struct sockaddr_in *sa) {
     return dup_msg(buf);
 }
 
+/* Resolve `host` (a literal IPv4 address or a DNS name) into `sa`.
+ *
+ * Phase5.1, Step4: `host` may now be a hostname (e.g. "example.com").
+ * Literal IPv4 addresses keep the old fast path (no name resolution cost);
+ * anything else is resolved with getaddrinfo().  `kind` (0=TCP, 1=UDP) picks
+ * the ai_socktype hint so the resolver returns an address appropriate for the
+ * caller's socket type. */
 static int fill_addr(struct sockaddr_in *sa, const char *host, int port,
-                     char **err_msg) {
+                     int kind, char **err_msg) {
     memset(sa, 0, sizeof(*sa));
     sa->sin_family = AF_INET;
     sa->sin_port = htons((unsigned short)port);
@@ -106,10 +114,31 @@ static int fill_addr(struct sockaddr_in *sa, const char *host, int port,
         sa->sin_addr.s_addr = INADDR_ANY;
         return 0;
     }
-    if (inet_pton(AF_INET, host, &sa->sin_addr) != 1) {
-        if (err_msg) *err_msg = dup_msg("invalid IPv4 host address");
+    /* fast path: already a literal IPv4 address */
+    if (inet_pton(AF_INET, host, &sa->sin_addr) == 1) {
+        return 0;
+    }
+    /* otherwise resolve the hostname via DNS (getaddrinfo) */
+    struct addrinfo hints, *result = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = (kind == 1) ? SOCK_DGRAM : SOCK_STREAM;
+    int rc = getaddrinfo(host, NULL, &hints, &result);
+    if (rc != 0 || !result) {
+        if (err_msg) {
+            const char *gerr = gai_strerror(rc);
+            size_t n = strlen(host) + strlen(gerr) + 32;
+            char *m = (char *)malloc(n);
+            if (m) snprintf(m, n, "cannot resolve host '%s': %s", host, gerr);
+            *err_msg = m ? m : dup_msg("cannot resolve host");
+        }
+        if (result) freeaddrinfo(result);
         return -1;
     }
+    /* use the first candidate (round-robin/fallback is out of scope) */
+    const struct sockaddr_in *ra = (const struct sockaddr_in *)result->ai_addr;
+    sa->sin_addr = ra->sin_addr;
+    freeaddrinfo(result);
     return 0;
 }
 
@@ -156,7 +185,7 @@ int net_socket_create(NetState *st, int kind, char **err_msg) {
 int net_bind(NetState *st, int sock_id, const char *host, int port, char **err_msg) {
     if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
     struct sockaddr_in sa;
-    if (fill_addr(&sa, host, port, err_msg) < 0) return -1;
+    if (fill_addr(&sa, host, port, st->kinds[sock_id], err_msg) < 0) return -1;
     if (bind(st->fds[sock_id], (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         if (err_msg) *err_msg = dup_errno("bind");
         return -1;
@@ -210,7 +239,7 @@ int net_try_accept(NetState *st, int listen_sock_id, char **peer_addr_out,
 int net_connect(NetState *st, int sock_id, const char *host, int port, char **err_msg) {
     if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
     struct sockaddr_in sa;
-    if (fill_addr(&sa, host, port, err_msg) < 0) return -1;
+    if (fill_addr(&sa, host, port, st->kinds[sock_id], err_msg) < 0) return -1;
     int rc = connect(st->fds[sock_id], (struct sockaddr *)&sa, sizeof(sa));
     if (rc == 0) return 0;
     if (errno == EINPROGRESS || errno == EWOULDBLOCK || errno == EALREADY) return -2;
@@ -259,7 +288,7 @@ long long net_sendto(NetState *st, int sock_id, const char *data, long long len,
                      const char *host, int port, char **err_msg) {
     if (!valid_id(st, sock_id)) { if (err_msg) *err_msg = dup_msg("invalid socket id"); return -1; }
     struct sockaddr_in sa;
-    if (fill_addr(&sa, host, port, err_msg) < 0) return -1;
+    if (fill_addr(&sa, host, port, st->kinds[sock_id], err_msg) < 0) return -1;
     ssize_t n = sendto(st->fds[sock_id], data, (size_t)len, 0,
                        (struct sockaddr *)&sa, sizeof(sa));
     if (n < 0) {

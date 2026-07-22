@@ -34,6 +34,7 @@
 #include "event_loop.h"
 #include "net.h"
 #include "http.h"
+#include "tls.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -3104,6 +3105,21 @@ static void http_send_all(Interp *it, NetState *st, int sock_id,
     }
 }
 
+/* Like http_send_all, but over a TLS session.  `fd` is the underlying raw
+ * socket fd, used only to wait for writability when the TLS layer would
+ * block. */
+static void tls_send_all(Interp *it, TlsConn *tls, int fd,
+                         const char *data, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        char *err = NULL;
+        long long n = tls_write(tls, data + off, (long long)(len - off), &err);
+        if (n == -2) { free(err); net_wait_fd(it, fd, 1); continue; }
+        if (n < 0)   { free(err); break; }
+        off += (size_t)n;
+    }
+}
+
 /* Serve a single request from an already-accepted static-file connection. */
 static void http_serve_static_conn(Interp *it, NetState *st, int conn_id,
                                    const char *root_dir) {
@@ -3313,26 +3329,31 @@ static Value http_run_server(Interp *it, int line, int port,
 
 /* --- minimal self-contained HTTP client over raw TCP (no TLS) --- */
 
-/* Parse "http://host[:port]/path" -> host/port/path (all malloc'd out).
- * Returns 0 on success, -1 on malformed/unsupported (e.g. https). */
+/* Parse "http(s)://host[:port]/path" -> host/port/path (all malloc'd out).
+ * `*is_https_out` is set to 1 for an https:// URL, 0 for http:// (or a
+ * scheme-less URL, which defaults to http).  The default port is 443 for
+ * https and 80 for http when no explicit ":port" is present.
+ * Returns 0 on success, -1 on malformed input. */
 static int http_parse_url(const char *url, char **host_out, int *port_out,
-                          char **path_out, char **err_out) {
-    if (strncmp(url, "https://", 8) == 0) {
-        if (err_out) *err_out = myon_strdup("https:// (TLS) is not supported by myon.http");
-        return -1;
-    }
+                          char **path_out, int *is_https_out, char **err_out) {
     const char *p = url;
-    if (strncmp(p, "http://", 7) == 0) p += 7;
+    int is_https = 0;
+    int default_port = 80;
+    if (strncmp(p, "https://", 8) == 0) {
+        p += 8; is_https = 1; default_port = 443;
+    } else if (strncmp(p, "http://", 7) == 0) {
+        p += 7;
+    }
     /* host[:port] up to '/' or end */
     const char *slash = strchr(p, '/');
     const char *hostend = slash ? slash : p + strlen(p);
     const char *colon = memchr(p, ':', (size_t)(hostend - p));
-    int port = 80;
+    int port = default_port;
     size_t hlen;
     if (colon) {
         hlen = (size_t)(colon - p);
         port = (int)strtol(colon + 1, NULL, 10);
-        if (port <= 0) port = 80;
+        if (port <= 0) port = default_port;
     } else {
         hlen = (size_t)(hostend - p);
     }
@@ -3341,6 +3362,7 @@ static int http_parse_url(const char *url, char **host_out, int *port_out,
     memcpy(host, p, hlen); host[hlen] = '\0';
     char *path = myon_strdup(slash ? slash : "/");
     *host_out = host; *port_out = port; *path_out = path;
+    if (is_https_out) *is_https_out = is_https;
     return 0;
 }
 
@@ -3351,8 +3373,8 @@ static Value http_client_request(Interp *it, int line, const char *url,
                                  const char *content_type) {
     (void)line;
     Value tup = value_array(NULL);
-    char *host = NULL, *path = NULL, *perr = NULL; int port = 80;
-    if (http_parse_url(url, &host, &port, &path, &perr) != 0) {
+    char *host = NULL, *path = NULL, *perr = NULL; int port = 80; int is_https = 0;
+    if (http_parse_url(url, &host, &port, &path, &is_https, &perr) != 0) {
         array_push(&tup, value_str(myon_strdup("")));
         array_push(&tup, value_int(0));
         array_push(&tup, value_error(perr ? perr : myon_strdup("bad URL")));
@@ -3382,6 +3404,20 @@ static Value http_client_request(Interp *it, int line, const char *url,
         return tup;
     }
 
+    /* For https:// establish a TLS session on top of the connected socket. */
+    TlsConn *tls = NULL;
+    if (is_https) {
+        char *terr = NULL;
+        tls = tls_connect(fd, host, &terr);
+        if (!tls) {
+            array_push(&tup, value_str(myon_strdup("")));
+            array_push(&tup, value_int(0));
+            array_push(&tup, value_error(terr ? terr : myon_strdup("TLS handshake failed")));
+            net_close(st, sock); free(host); free(path);
+            return tup;
+        }
+    }
+
     /* build request */
     size_t blen = body ? strlen(body) : 0;
     char head[1024];
@@ -3395,8 +3431,13 @@ static Value http_client_request(Interp *it, int line, const char *url,
         hn = snprintf(head, sizeof(head),
             "%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
             method, path, host);
-    http_send_all(it, st, sock, head, (size_t)hn);
-    if (blen) http_send_all(it, st, sock, body, blen);
+    if (tls) {
+        tls_send_all(it, tls, fd, head, (size_t)hn);
+        if (blen) tls_send_all(it, tls, fd, body, blen);
+    } else {
+        http_send_all(it, st, sock, head, (size_t)hn);
+        if (blen) http_send_all(it, st, sock, body, blen);
+    }
 
     /* read the whole response */
     size_t cap = 8192, len = 0;
@@ -3404,11 +3445,14 @@ static Value http_client_request(Interp *it, int line, const char *url,
     for (;;) {
         if (len == cap) { cap *= 2; rbuf = (char *)myon_xrealloc(rbuf, cap); }
         char *rerr = NULL;
-        long long n = net_recv(st, sock, rbuf + len, (long long)(cap - len), &rerr);
+        long long n;
+        if (tls) n = tls_read(tls, rbuf + len, (long long)(cap - len), &rerr);
+        else     n = net_recv(st, sock, rbuf + len, (long long)(cap - len), &rerr);
         if (n == -2) { free(rerr); net_wait_fd(it, fd, 0); continue; }
         if (n <= 0)  { free(rerr); break; } /* 0 == EOF/close */
         len += (size_t)n;
     }
+    if (tls) tls_close(tls);
     net_close(st, sock);
     free(host); free(path);
 
