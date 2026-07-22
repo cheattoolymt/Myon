@@ -1,0 +1,5 @@
+# Expect a non-zero exit: recursion deeper than MYON_MAX_CALL_DEPTH must be
+# caught by the interpreter's call-depth guard and reported as a runtime error
+# (graceful exit code 1), rather than overflowing the C stack and dying with
+# SIGSEGV (exit code 139).  Only the non-zero exit is pinned, not the exact
+# message text (same convention as step12_overflow.err).
