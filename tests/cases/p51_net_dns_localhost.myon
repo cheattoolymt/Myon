@@ -1,0 +1,44 @@
+# Phase5.1, Step5: DNS name resolution regression test.
+#
+# A TCP server binds to the loopback literal 127.0.0.1, and a client connects
+# to it using the hostname "localhost".  Before Phase5.1, connect() only
+# accepted literal IPv4 addresses and "localhost" would fail with
+# "invalid IPv4 host address".  Now fill_addr() resolves names via
+# getaddrinfo(), so the hostname resolves to the loopback address and the
+# round-trip succeeds.
+#
+# This uses only loopback so it is safe on CI (no external network needed).
+
+module myon.stdio
+module myon.net
+
+srv, e1 = myon.net.tcp_socket()
+myon.net.bind(srv, "127.0.0.1", 0)
+myon.net.listen(srv, 8)
+sport, ep = myon.net.local_port(srv)
+
+myon.async myon.func server() ret str {
+    conn, ae = myon.net.accept(srv)
+    data, re = myon.net.recv(conn, 1024)
+    myon.net.send(conn, str("pong"))
+    myon.net.close(conn)
+    ret data
+}
+
+myon.async myon.func client() ret str {
+    cli, ce = myon.net.tcp_socket()
+    # Connect by hostname — exercises DNS resolution to the loopback address.
+    ok, cerr = myon.net.connect(cli, "localhost", sport)
+    myon.net.send(cli, str("ping"))
+    reply, re = myon.net.recv(cli, 1024)
+    myon.net.close(cli)
+    ret reply
+}
+
+ts = server()
+tc = client()
+got = myon.await tc
+srv_got = myon.await ts
+myon.net.close(srv)
+myon.print(str("server got: " + srv_got))
+myon.print(str("client got: " + got))

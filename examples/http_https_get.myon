@@ -1,0 +1,34 @@
+# Phase5.1, Step6: HTTPS/TLS demo for myon.http.
+#
+# myon.http.get / myon.http.post now understand https:// URLs.  For an
+# https:// URL the client opens a normal TCP connection and then performs a
+# native TLS handshake on top of it (OpenSSL, linked via -lssl -lcrypto), with
+# SNI and best-effort certificate verification against the system trust store.
+#
+# Run with:  ./myon examples/http_https_get.myon
+#
+# NOTE: this reaches out to the public internet (https://example.com).  In a
+# sandboxed / offline environment the request simply fails with a connect or
+# TLS error, which the script reports instead of crashing.
+#
+# SECURITY: certificate verification here is best-effort and this is not a
+# hardened TLS client.  Do not send secrets over untrusted networks with it.
+
+module myon.stdio
+module myon.http
+module myon.string
+
+url = str("https://example.com/")
+myon.print(str("GET " + url))
+
+body, status, err = myon.http.get(url)
+
+myon.if err != myon.nil then {
+    myon.print(str("request failed:"))
+    myon.print(err)
+} myon.else {
+    myon.print(str("status code:"))
+    myon.print(status)
+    myon.print(str("body length (bytes):"))
+    myon.print(myon.string.length(body))
+}

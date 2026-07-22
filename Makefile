@@ -14,7 +14,10 @@
 
 CC      ?= cc
 CFLAGS  ?= -std=c11 -Wall -Wextra -Wpedantic -O2
-LDLIBS  ?= -lm
+# Phase5.1 Step6: HTTPS/TLS in myon.http is implemented natively against
+# OpenSSL, so the OpenSSL development package (libssl-dev / openssl-devel) is
+# a required build dependency and we always link libssl/libcrypto.
+LDLIBS  ?= -lm -lssl -lcrypto
 
 # Phase3 C FFI needs the dynamic loader (dlopen/dlsym/dlclose) on Linux.
 # On macOS these live in libSystem (no extra flag); Windows uses its own API.
