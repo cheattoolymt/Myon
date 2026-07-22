@@ -1119,6 +1119,8 @@ UNIXエポック（1970-01-01 UTC）からの経過時間で、いずれも `int
 | `now` | `() ret int` | 現在時刻（UNIXエポック秒）。C標準の`time(NULL)`相当 |
 | `now_ms` | `() ret int` | 現在時刻（UNIXエポックミリ秒）。`clock_gettime(CLOCK_REALTIME)`相当 |
 | `sleep_ms` | `(ms: int) ret void` | msミリ秒スリープ（`nanosleep`）。`ms<=0`は何もせず即座に返す |
+| `frame_start` | `() ret int` | フレーム開始時刻を記録する（Phase5.1）。実装は`now_ms()`と同じで、意味を明確にするための糖衣関数 |
+| `frame_wait` | `(frame_start_ms: int, target_fps: int) ret int` | ゲームループ用のFPS制御（Phase5.1）。`frame_start`で記録した時刻から現在までの経過時間を求め、`1000/target_fps`ミリ秒に満たない分だけスリープする。戻り値は実際に経過した時間（スリープ込みのdt、ミリ秒）。`target_fps<=0`はスリープせず経過時間だけを返す（FPS制限なし） |
 
 `now_ms()` は `now() * 1000` とほぼ一致する（同一時刻の呼び出しなら
 数ミリ秒程度の差）。POSIX環境（Linux/macOS）を前提とする。
@@ -1134,6 +1136,31 @@ myon.print(t2 - t1 >= 1)     // true（1秒以上経過）
 myon.print(myon.time.now() > 0)      // true
 myon.print(myon.time.now_ms() > 0)   // true
 ```
+
+#### ゲームループヘルパー（Phase5.1）
+
+`frame_start` / `frame_wait` は、毎フレームの経過時間（dt）計算と目標FPS
+維持のためのスリープという定型処理を提供する。ゲームループの車輪の
+再発明を避けるための薄いヘルパーである。`frame_wait` は `sleep_ms` と
+同じスリープ経路を使うため、コルーチン内（`myon.async`/`myon.await`）で
+呼び出した場合はプロセス全体をブロックせずイベントループに制御を譲る。
+
+```myon
+module myon.time
+module myon.stdio
+
+myon.while true {
+    t0 = myon.time.frame_start()
+    // ここでゲームの更新・描画処理
+    dt = myon.time.frame_wait(t0, 60)  // 60FPSを目標
+    // dt（ミリ秒）を物理演算等の時間ベース計算に使ってもよい
+}
+```
+
+`target_fps` に `10` を指定すると、1フレームの目標時間は `1000/10 = 100`
+ミリ秒となり、更新・描画処理が100msより短く終わった場合はその差分だけ
+スリープして、ループの反復間隔がおおよそ100msに揃う。厳密なリアルタイム性は
+OSのスケジューラに依存するため、多少の誤差は許容される。
 
 ### 10.6 myon.random（Phase4）
 
