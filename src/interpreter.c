@@ -3834,6 +3834,48 @@ static void assign_target(Interp *it, Env *env, Expr *target, Value v) {
 /* Statement execution                                                 */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Assignment / shadowing resolution shared by every plain (name-target)
+ * assignment site: single assignment (`x = ...`) and multiple assignment
+ * (`x, y = ...`).  Implements the spec 9.2 rule in one place so the two
+ * sites cannot drift apart again (see the historical multi-assign bug
+ * where the enclosing-scope lookup was missing).
+ *
+ * Rule (spec 9.2):
+ *   1. If `name` is bound in the *current* scope, update it (env_set).
+ *   2. Else if `name` is bound in some *enclosing* scope:
+ *        a. inside an explicit `{ }` block (env->is_block) this is an
+ *           illegal attempt to shadow an outer variable -> runtime_error.
+ *        b. otherwise (function body etc.) assign through to the existing
+ *           outer binding (env_set walks the chain).
+ *   3. If `name` is bound nowhere, define it in the current scope.
+ *
+ * Takes ownership of `v` (either stored via env_set/env_define, or freed
+ * on the error path).
+ */
+static void assign_or_define(Interp *it, Env *env, int line,
+                             const char *name, Value v) {
+    if (env_defined_local(env, name)) {
+        env_set(env, name, v);
+        return;
+    }
+    Value tmp;
+    int outer = (env->parent && env_get(env->parent, name, &tmp));
+    if (outer) value_free(&tmp);
+    if (outer && env->is_block) {
+        value_free(&v);
+        runtime_error(it, line,
+            "redefinition of '%s' shadows an outer variable (forbidden, spec 9.2)",
+            name);
+    }
+    if (outer) {
+        /* assign through to the existing outer binding */
+        env_set(env, name, v);
+    } else {
+        env_define(env, name, v);
+    }
+}
+
 static Flow do_multi_assign(Interp *it, Env *env, Stmt *s, Value v) {
     /* v must be a tuple (array with NULL elem_type) from a multi-return */
     int total = 1 + s->as.assign.extra_count;
@@ -3853,8 +3895,10 @@ static Flow do_multi_assign(Interp *it, Env *env, Stmt *s, Value v) {
     for (int i = 0; i < total; i++) {
         const char *nm = (i == 0) ? s->as.assign.name : s->as.assign.extra_names[i - 1];
         Value elem = value_copy(&a->items[i]);
-        if (env_defined_local(env, nm)) env_set(env, nm, elem);
-        else                            env_define(env, nm, elem);
+        /* spec 9.2: same resolution as single assignment — update an
+         * existing (local or enclosing) binding, or define a new one,
+         * rejecting illegal shadowing inside `{ }` blocks. */
+        assign_or_define(it, env, s->line, nm, elem);
     }
     value_free(&v);
     return FLOW_NORMAL;
@@ -3951,31 +3995,14 @@ static Flow exec_stmt(Interp *it, Env *env, Stmt *s) {
                     s->as.assign.name, want, got);
             }
 
-            /* Assignment / shadowing rules (spec 9.2):
+            /* Assignment / shadowing rules (spec 9.2) — shared with
+             * multiple assignment via assign_or_define():
              *  - re-assignment to a name already bound (locally or in an
              *    enclosing scope) updates that binding.
              *  - inside an explicit `{ }` block, introducing a name that
              *    already exists in an outer scope is forbidden (shadowing).
              */
-            if (env_defined_local(env, s->as.assign.name)) {
-                env_set(env, s->as.assign.name, v);
-            } else {
-                Value tmp;
-                int outer = (env->parent && env_get(env->parent, s->as.assign.name, &tmp));
-                if (outer) value_free(&tmp);
-                if (outer && env->is_block) {
-                    value_free(&v);
-                    runtime_error(it, s->line,
-                        "redefinition of '%s' shadows an outer variable (forbidden, spec 9.2)",
-                        s->as.assign.name);
-                }
-                if (outer) {
-                    /* assign through to the existing outer binding */
-                    env_set(env, s->as.assign.name, v);
-                } else {
-                    env_define(env, s->as.assign.name, v);
-                }
-            }
+            assign_or_define(it, env, s->line, s->as.assign.name, v);
             return FLOW_NORMAL;
         }
 
@@ -4089,7 +4116,13 @@ static Flow exec_stmt(Interp *it, Env *env, Stmt *s) {
         }
 
         case STMT_EXPOSE: {
-            /* copy the named binding from this scope into the parent (spec 9.1) */
+            /* copy the named binding from this scope into the parent (spec 9.1).
+             *
+             * NOTE: this deliberately does NOT go through assign_or_define().
+             * Per spec 9.1, `myon.expose` publishes a binding exactly one
+             * level outward (into env->parent), not recursively up the whole
+             * chain, so the single-level env_defined_local(env->parent, ...)
+             * check below is the intended behaviour and is left unchanged. */
             Value v;
             if (!env_get(env, s->as.expose_name, &v))
                 runtime_error(it, s->line, "myon.expose: '%s' is not defined here",

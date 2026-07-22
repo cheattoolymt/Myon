@@ -1,0 +1,20 @@
+# Phase5.1 Step1-3: multiple assignment inside a function must update an
+# existing OUTER-scope variable, not create a shadowing local (spec 9.2).
+module myon.stdio
+
+myon.func pair() ret int, int {
+    ret 1, 2
+}
+
+x = 100
+y = 200
+
+myon.func inner() ret void {
+    x, y = pair()     # updates the outer x, y (no new locals)
+    myon.print(x)     # 1
+    myon.print(y)     # 2
+}
+
+inner()
+myon.print(x)         # 1  (outer x was updated)
+myon.print(y)         # 2  (outer y was updated)
