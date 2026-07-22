@@ -1,0 +1,15 @@
+# Phase5.1 Step1-3: a multiple assignment inside an explicit `{ }` block that
+# targets names already bound in an outer scope is illegal shadowing and must
+# be a runtime error (spec 9.2), exactly like single assignment.
+module myon.stdio
+
+myon.func pair() ret int, int {
+    ret 1, 2
+}
+
+x = 100
+y = 200
+{
+    x, y = pair()     # ERROR: shadows outer x, y inside a block
+    myon.print(x)
+}
