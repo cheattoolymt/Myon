@@ -1532,6 +1532,61 @@ static int call_time(Interp *it, Env *env, const char *name, Expr *call, Value *
         return 1;
     }
 
+    /* myon.time.frame_start() ret int — Phase5.1 Step10 game-loop helper.
+     * Semantic alias of now_ms(): records the wall-clock start of a frame
+     * in milliseconds so that frame_wait() can pace the loop to a target
+     * FPS.  Kept as a distinct name purely to make game loops read clearly. */
+    if (strcmp(name, "myon.time.frame_start") == 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        long long ms = (long long)ts.tv_sec * 1000 + (long long)ts.tv_nsec / 1000000;
+        *out = value_int(ms);
+        return 1;
+    }
+
+    /* myon.time.frame_wait(frame_start_ms, target_fps) ret int
+     *   Phase5.1 Step10 game-loop helper.  Given the timestamp recorded by
+     *   frame_start() and a target FPS, sleep just long enough for the frame
+     *   to occupy 1000/target_fps milliseconds, then return the total elapsed
+     *   time (dt) for the frame in milliseconds (sleep included).  A
+     *   target_fps of 0 or below disables the cap: no sleep, elapsed time is
+     *   returned as-is.  Uses the same sleep path as sleep_ms so it yields to
+     *   the event loop when running inside a coroutine. */
+    if (strcmp(name, "myon.time.frame_wait") == 0) {
+        Value a = eval_arg(it, env, call, 0), b = eval_arg(it, env, call, 1);
+        if (a.type != TYPE_INT || b.type != TYPE_INT) {
+            value_free(&a); value_free(&b);
+            runtime_error(it, line, "myon.time.frame_wait expects (int, int)");
+        }
+        long long frame_start_ms = a.as.i;
+        long long target_fps = b.as.i;
+        value_free(&a); value_free(&b);
+
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        long long now_ms = (long long)ts.tv_sec * 1000 + (long long)ts.tv_nsec / 1000000;
+        long long elapsed = now_ms - frame_start_ms;
+        if (elapsed < 0) elapsed = 0; /* guard against clock going backwards */
+
+        if (target_fps > 0) {
+            long long target_ms = 1000 / target_fps;
+            long long remaining = target_ms - elapsed;
+            if (remaining > 0) {
+                if (it->current_task && it->loop) {
+                    event_loop_sleep_ms(it->loop, remaining);
+                } else {
+                    struct timespec req;
+                    req.tv_sec  = (time_t)(remaining / 1000);
+                    req.tv_nsec = (long)((remaining % 1000) * 1000000L);
+                    nanosleep(&req, NULL);
+                }
+                elapsed = target_ms;
+            }
+        }
+        *out = value_int(elapsed);
+        return 1;
+    }
+
     return 0;
 }
 

@@ -1,0 +1,29 @@
+# Phase5.1 Step10/11: game-loop helpers myon.time.frame_start / frame_wait.
+#
+# Timing is inherently sensitive to the OS scheduler, so this regression test
+# deliberately avoids asserting on exact durations.  Instead it exercises the
+# helpers a few times and checks only for obvious breakage: frame_start must
+# return a positive epoch-ms timestamp, and frame_wait must return a
+# non-negative dt in both capped and uncapped modes without crashing.
+module myon.time
+module myon.stdio
+
+# frame_start() returns a wall-clock timestamp in ms; it must be positive.
+t0 = myon.time.frame_start()
+myon.if t0 > 0 then { myon.print(str("start_ok")) } myon.else { myon.print(str("start_bad")) }
+
+# Capped mode: at 60 FPS one frame targets ~16ms, so dt must be non-negative.
+ok = true
+i = 0
+myon.while i < 3 {
+    f = myon.time.frame_start()
+    dt = myon.time.frame_wait(f, 60)
+    myon.if dt < 0 then { ok = false }
+    i = i + 1
+}
+myon.if ok then { myon.print(str("capped_ok")) } myon.else { myon.print(str("capped_bad")) }
+
+# Uncapped mode (target_fps <= 0): no sleep, dt is still non-negative.
+f2 = myon.time.frame_start()
+dt2 = myon.time.frame_wait(f2, 0)
+myon.if dt2 >= 0 then { myon.print(str("uncapped_ok")) } myon.else { myon.print(str("uncapped_bad")) }
